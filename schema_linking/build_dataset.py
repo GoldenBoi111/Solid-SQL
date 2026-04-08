@@ -194,6 +194,7 @@ def load_schemas_with_sqlite_fallback(schema_dir: str) -> Dict[str, Dict]:
     Load schemas from JSON files, then fill in any missing ones
     by introspecting SQLite databases in subdirectories.
     """
+    import sqlite3
     schemas = load_schemas_from_dir(schema_dir)
     schema_path = Path(schema_dir)
     pre_existing = set(schemas.keys())
@@ -203,7 +204,10 @@ def load_schemas_with_sqlite_fallback(schema_dir: str) -> Dict[str, Dict]:
     for db_file in sqlite_files:
         db_id = db_file.stem
         if db_id not in schemas:
-            schemas[db_id] = load_schema_from_sqlite(str(db_file))
+            try:
+                schemas[db_id] = load_schema_from_sqlite(str(db_file))
+            except (sqlite3.DatabaseError, ValueError) as e:
+                print(f"  Warning: Skipping corrupted SQLite file: {db_file} ({e})")
 
     new_count = len(schemas) - len(pre_existing)
     if new_count:

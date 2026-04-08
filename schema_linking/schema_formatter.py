@@ -173,8 +173,14 @@ def load_schemas_from_dir(schema_dir: str) -> Dict[str, Dict]:
 
     # Otherwise, load individual JSON files
     for json_file in schema_path.glob("*.json"):
-        schema = load_schema(str(json_file))
-        db_id = schema.get("db_id", json_file.stem)
-        schemas[db_id] = schema
+        with open(json_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # Skip files that are lists (e.g. example files like train.json)
+        if isinstance(data, list):
+            continue
+
+        db_id = data.get("db_id", json_file.stem)
+        schemas[db_id] = data
 
     return schemas
