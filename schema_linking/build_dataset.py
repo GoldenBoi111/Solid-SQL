@@ -189,18 +189,16 @@ def save_jsonl(data: List[Dict], output_path: str) -> None:
     print(f"Saved {len(data)} entries to {output_path}")
 
 
-def load_schemas_with_sqlite_fallback(schema_dir: str) -> Dict[str, Dict]:
+def load_schemas_from_databases(db_dir: str) -> Dict[str, Dict]:
     """
-    Load schemas from JSON files, then fill in any missing ones
-    by introspecting SQLite databases in subdirectories.
+    Load schemas by introspecting SQLite databases in a directory tree.
+    Recursively scans for *.sqlite files and extracts table/column metadata.
     """
     import sqlite3
-    schemas = load_schemas_from_dir(schema_dir)
-    schema_path = Path(schema_dir)
-    pre_existing = set(schemas.keys())
+    schemas = {}
+    db_path = Path(db_dir)
 
-    # Scan recursively for .sqlite files
-    sqlite_files = list(schema_path.rglob("*.sqlite"))
+    sqlite_files = list(db_path.rglob("*.sqlite"))
     for db_file in sqlite_files:
         db_id = db_file.stem
         if db_id not in schemas:
@@ -209,18 +207,14 @@ def load_schemas_with_sqlite_fallback(schema_dir: str) -> Dict[str, Dict]:
             except (sqlite3.DatabaseError, ValueError) as e:
                 print(f"  Warning: Skipping corrupted SQLite file: {db_file} ({e})")
 
-    new_count = len(schemas) - len(pre_existing)
-    if new_count:
-        print(f"  Loaded {new_count} schemas from SQLite files")
-
+    print(f"  Loaded {len(schemas)} schemas from SQLite databases")
     return schemas
 
 
 def main():
     parser = argparse.ArgumentParser(description="Build schema linking training dataset")
-    parser.add_argument("--data-dir", default=RAW_DATA_DIR, help="Directory with dataset JSON files")
-    parser.add_argument("--schema-dir", default="", help="Directory with schema JSON files (optional)")
-    parser.add_argument("--db-root", default=DB_ROOT, help="Root directory with SQLite databases")
+    parser.add_argument("--train-json", required=True, help="Path to train.json file")
+    parser.add_argument("--db-dir", required=True, help="Root directory with SQLite database files")
     parser.add_argument("--train-output", default=OUTPUT_TRAIN_PATH, help="Output train JSONL path")
     parser.add_argument("--val-output", default=OUTPUT_VAL_PATH, help="Output val JSONL path")
     parser.add_argument("--val-ratio", type=float, default=VAL_SPLIT_RATIO, help="Validation split ratio")
@@ -231,20 +225,20 @@ def main():
     print("Building Schema Linking Dataset")
     print("=" * 60)
 
-    # Load examples
-    print(f"\nLoading dataset examples from: {args.data_dir}")
-    examples = load_dataset_examples(args.data_dir)
+    # Load examples from the specified train.json
+    print(f"\nLoading dataset examples from: {args.train_json}")
+    with open(args.train_json, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    examples = data if isinstance(data, list) else data.get("data", data.get("examples", [data]))
     print(f"Loaded {len(examples)} examples")
 
-    # Load schemas (JSON files + SQLite fallback)
-    schema_dir = args.schema_dir if args.schema_dir else args.data_dir
-    print(f"\nLoading schemas from: {schema_dir}")
-    schemas = load_schemas_with_sqlite_fallback(schema_dir)
-    print(f"Loaded {len(schemas)} schemas")
+    # Load schemas from SQLite databases
+    print(f"\nLoading schemas from: {args.db_dir}")
+    schemas = load_schemas_from_databases(args.db_dir)
 
     # Process
     print(f"\nProcessing examples...")
-    training_data = process_dataset(examples, schemas, args.db_root, args.dialect)
+    training_data = process_dataset(examples, schemas, args.db_dir, args.dialect)
 
     # Split
     train_data, val_data = split_dataset(training_data, val_ratio=args.val_ratio)
