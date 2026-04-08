@@ -7,11 +7,46 @@ suitable for inclusion in training prompts.
 Supports two modes:
 1. Compact: "Table(col1, col2, col3)" — used for inference
 2. Detailed: includes column types and descriptions — used for richer prompts
+
+Also supports loading schemas directly from SQLite database files.
 """
 
+import sqlite3
 from typing import Dict, List, Optional
 from pathlib import Path
 import json
+
+
+def load_schema_from_sqlite(db_path: str) -> Dict:
+    """
+    Introspect a SQLite database and return a Spider-format schema dict.
+
+    Output:
+    {
+        "db_id": "sales",
+        "table_names_original": ["Customers", "Products", ...],
+        "column_names_original": [[-1, "*"], [0, "id"], [0, "name"], ...]
+    }
+    """
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;")
+    tables = [row[0] for row in cursor.fetchall()]
+
+    schema = {
+        "db_id": Path(db_path).stem,
+        "table_names_original": tables,
+        "column_names_original": [[-1, "*"]],
+    }
+
+    for table_idx, table_name in enumerate(tables):
+        cursor.execute(f"PRAGMA table_info('{table_name}');")
+        for col in cursor.fetchall():
+            col_name = col[1]  # Column name is at index 1
+            schema["column_names_original"].append([table_idx, col_name])
+
+    conn.close()
+    return schema
 
 
 def format_schema_compact(schema: Dict) -> str:

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import List, Dict, Tuple
 
 from sql_parser import extract_schema_labels
-from schema_formatter import format_schema_compact, load_schemas_from_dir
+from schema_formatter import format_schema_compact, load_schemas_from_dir, load_schema_from_sqlite
 from config import (
     RAW_DATA_DIR, DB_ROOT, OUTPUT_TRAIN_PATH, OUTPUT_VAL_PATH,
     VAL_SPLIT_RATIO, INSTRUCTION_TEMPLATE, SQL_DIALECT,
@@ -189,6 +189,29 @@ def save_jsonl(data: List[Dict], output_path: str) -> None:
     print(f"Saved {len(data)} entries to {output_path}")
 
 
+def load_schemas_with_sqlite_fallback(schema_dir: str) -> Dict[str, Dict]:
+    """
+    Load schemas from JSON files, then fill in any missing ones
+    by introspecting SQLite databases in subdirectories.
+    """
+    schemas = load_schemas_from_dir(schema_dir)
+    schema_path = Path(schema_dir)
+    pre_existing = set(schemas.keys())
+
+    # Scan recursively for .sqlite files
+    sqlite_files = list(schema_path.rglob("*.sqlite"))
+    for db_file in sqlite_files:
+        db_id = db_file.stem
+        if db_id not in schemas:
+            schemas[db_id] = load_schema_from_sqlite(str(db_file))
+
+    new_count = len(schemas) - len(pre_existing)
+    if new_count:
+        print(f"  Loaded {new_count} schemas from SQLite files")
+
+    return schemas
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build schema linking training dataset")
     parser.add_argument("--data-dir", default=RAW_DATA_DIR, help="Directory with dataset JSON files")
@@ -209,10 +232,10 @@ def main():
     examples = load_dataset_examples(args.data_dir)
     print(f"Loaded {len(examples)} examples")
 
-    # Load schemas
+    # Load schemas (JSON files + SQLite fallback)
     schema_dir = args.schema_dir if args.schema_dir else args.data_dir
     print(f"\nLoading schemas from: {schema_dir}")
-    schemas = load_schemas_from_dir(schema_dir)
+    schemas = load_schemas_with_sqlite_fallback(schema_dir)
     print(f"Loaded {len(schemas)} schemas")
 
     # Process
