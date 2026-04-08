@@ -5,9 +5,12 @@ Reads a JSON file with fields like db_id, question, gold_sql and generates
 2 question variations per entry using a local vLLM model with structured output.
 """
 
+import csv
 import json
 import argparse
+import sqlite3
 import sys
+from pathlib import Path
 from vllm_model_manager import vLLMModelManager, HAS_STRUCTUREED_OUTPUTS
 
 
@@ -23,17 +26,103 @@ VARIATION_SCHEMA = {
 }
 
 
-def build_prompt(question: str) -> str:
+def _read_csv_descriptions(csv_dir: Path) -> str:
+    """Read all CSV description files and return formatted column metadata."""
+    if not csv_dir.is_dir():
+        return ""
+
+    parts = []
+    for csv_file in sorted(csv_dir.glob("*.csv")):
+        table_name = csv_file.stem
+        try:
+            with open(csv_file, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+            if not rows:
+                continue
+
+            # Each row typically has: column_name, data_type, description (or similar)
+            # Build a column description string
+            col_info = []
+            for row in rows:
+                # Try common column name conventions
+                col_name = row.get("column_name", row.get("Column", row.get("COLUMN_NAME", "")))
+                col_type = row.get("data_type", row.get("Type", row.get("DATA_TYPE", "")))
+                col_desc = row.get("description", row.get("Description", row.get("COMMENT", "")))
+
+                if col_name:
+                    info = f"  - {col_name}"
+                    if col_type:
+                        info += f" ({col_type})"
+                    if col_desc:
+                        info += f": {col_desc}"
+                    col_info.append(info)
+
+            if col_info:
+                parts.append(f"Table: {table_name}\n" + "\n".join(col_info))
+        except Exception as e:
+            print(f"  Warning: Could not read {csv_file}: {e}")
+
+    return "\n".join(parts) if parts else ""
+
+
+def get_db_schema(db_path: str, db_id: str = "", db_root: str = "") -> str:
+    """Extract table and column info from a SQLite database + CSV descriptions.
+
+    Returns formatted schema text with table/column info and CSV descriptions.
+    """
+    db_path = Path(db_path)
+    sections = []
+
+    # 1. Read CSV descriptions if available
+    if db_root and db_id:
+        csv_dir = Path(db_root) / db_id / "database_description"
+        csv_desc = _read_csv_descriptions(csv_dir)
+        if csv_desc:
+            sections.append(csv_desc)
+
+    # 2. Read SQLite schema via PRAGMA
+    try:
+        conn = sqlite3.connect(str(db_path))
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;")
+        tables = cursor.fetchall()
+
+        pragma_parts = []
+        for (table_name,) in tables:
+            cursor.execute(f"PRAGMA table_info('{table_name}');")
+            columns = cursor.fetchall()
+            col_defs = ", ".join(f"{col[1]} {col[2]}" for col in columns)
+            pragma_parts.append(f"Table: {table_name} ({col_defs})")
+
+        conn.close()
+        if pragma_parts:
+            sections.append("SQLite Schema:\n" + "\n".join(pragma_parts))
+    except Exception as e:
+        sections.append(f"Error reading SQLite schema: {e}")
+
+    return "\n\n".join(sections) if sections else "No schema found."
+
+
+def build_prompt(question: str, schema_text: str = "") -> str:
     """Build a prompt asking the model to generate 2 variations of the question."""
+    schema_section = ""
+    if schema_text:
+        schema_section = f"""Database Schema:
+{schema_text}
+
+"""
+
     return f"""Given the following question, generate 2 new variations.
 
-Original Question: {question}
+{schema_section}Original Question: {question}
 
 Instructions:
 - Change the sentence structure significantly
 - Use synonyms where possible
 - Make each variation read naturally as a brand new question
 - Preserve the original meaning and intent
+- Reference real table and column names from the schema where appropriate
 
 Return your response as a JSON object with these exact keys:
 - q1: the first variation
@@ -52,6 +141,7 @@ def process_file(
     batch_size: int,
     max_tokens: int,
     temperature: float,
+    db_root: str = "",
 ):
     """Process each entry in the JSON file and generate question variations."""
     # Load input data
@@ -83,8 +173,19 @@ def process_file(
         temperature=temperature,
     )
 
-    # Build prompts for all entries
-    prompts = [build_prompt(entry["question"]) for entry in valid_entries]
+    # Build prompts with optional schema injection
+    prompts = []
+    for entry in valid_entries:
+        schema_text = ""
+        db_id = entry.get("db_id", "")
+        if db_root and db_id:
+            db_path = Path(db_root) / f"{db_id}.sqlite"
+            if db_path.exists():
+                schema_text = get_db_schema(str(db_path), db_id=db_id, db_root=db_root)
+                print(f"  Loaded schema for db_id '{db_id}' from {db_path}")
+            else:
+                print(f"  Warning: Database not found for db_id '{db_id}' at {db_path}")
+        prompts.append(build_prompt(entry["question"], schema_text))
 
     print(f"\nGenerating variations for {len(prompts)} prompts (batch_size={batch_size})...")
 
@@ -155,6 +256,11 @@ def main():
         default=0.7,
         help="Sampling temperature (default: 0.7)",
     )
+    parser.add_argument(
+        "--db-root",
+        default="",
+        help="Path to root directory containing SQLite databases (e.g. ./databases/)",
+    )
     args = parser.parse_args()
 
     process_file(
@@ -165,6 +271,7 @@ def main():
         batch_size=args.batch_size,
         max_tokens=args.max_tokens,
         temperature=args.temperature,
+        db_root=args.db_root,
     )
 
 
