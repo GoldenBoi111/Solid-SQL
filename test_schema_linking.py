@@ -85,14 +85,18 @@ def main():
         except json.JSONDecodeError:
             gt = {"error": "Failed to parse ground truth"}
 
-        print(f"\nPredicted tables: {json.dumps(prediction.get('tables', []), indent=2)}")
-        print(f"Ground truth tables: {json.dumps(gt.get('tables', []), indent=2)}")
-
-        print(f"\nPredicted columns: {json.dumps(prediction.get('columns', []), indent=2)}")
-        print(f"Ground truth columns: {json.dumps(gt.get('columns', []), indent=2)}")
-
+        # Show raw model output if there's an error or empty result
         if "error" in prediction:
             print(f"\n⚠ Model error: {prediction.get('error')}")
+            print(f"Raw output: {prediction.get('raw', '')[:500]}")
+        elif not prediction.get("tables") and not prediction.get("columns"):
+            print(f"\n⚠ Empty prediction — raw output:")
+            print(f"  {prediction}")
+
+        print(f"\nPredicted tables: {json.dumps(prediction.get('tables', []), indent=2)}")
+        print(f"Ground truth tables: {json.dumps(gt.get('tables', []), indent=2)}")
+        print(f"\nPredicted columns: {json.dumps(prediction.get('columns', []), indent=2)}")
+        print(f"Ground truth columns: {json.dumps(gt.get('columns', []), indent=2)}")
 
     print(f"\n{'='*60}")
     print(f"Done. Tested {limit} examples.")

@@ -1,8 +1,11 @@
 """
-Schema Linking Inference
+Schema Linking Inference (vLLM + LoRA)
 
-Uses the fine-tuned LoRA adapter to predict relevant tables and columns
-from a natural language question and database schema.
+Uses vLLM with forced JSON schema output and dynamic LoRA adapter loading
+to predict relevant tables and columns from a question and database schema.
+
+The LoRA adapter is loaded per-prediction-batch and unloaded after,
+so the base model stays clean for other tasks.
 
 Usage:
     from schema_linking.inference import SchemaLinker
@@ -17,7 +20,6 @@ Usage:
         question="How many singers are older than 20?",
         schema_text="Singer(id, name, age)\nAlbum(id, singer_id, title)",
     )
-    # Returns: {"tables": [...], "columns": [...]}
 
     # Batch prediction
     results = linker.predict_batch([
@@ -30,35 +32,32 @@ import json
 from pathlib import Path
 from typing import List, Dict, Optional, Union
 
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from peft import PeftModel
-
 from .config import (
     MODEL_NAME, OUTPUT_DIR, MAX_SEQ_LENGTH,
-    INSTRUCTION_TEMPLATE, BF16,
+    INSTRUCTION_TEMPLATE, OUTPUT_SCHEMA,
+    LORA_R,
 )
 from .schema_formatter import format_schema_compact, load_schemas_from_dir
 
 
 class SchemaLinker:
-    """Loads a fine-tuned LoRA adapter and generates schema linking predictions."""
+    """Uses vLLM with a LoRA adapter and forced JSON schema for inference."""
 
     def __init__(
         self,
         base_model: str = MODEL_NAME,
         adapter_path: str = "",
-        device: str = "",
+        tensor_parallel_size: int = 1,
         max_seq_length: int = MAX_SEQ_LENGTH,
     ):
         """
         Initialize the schema linker.
 
         Args:
-            base_model: Hugging Face model name or local path for the base model
+            base_model: Hugging Face model name or local path
             adapter_path: Path to the fine-tuned LoRA adapter directory
-            device: Device override (e.g., "cuda:0"). Auto-detected if empty.
-            max_seq_length: Maximum sequence length for tokenization
+            tensor_parallel_size: Number of GPUs for tensor parallelism
+            max_seq_length: Maximum sequence length (prompt + output)
         """
         if not adapter_path:
             adapter_path = str(Path(OUTPUT_DIR) / "lora_adapter")
@@ -72,45 +71,28 @@ class SchemaLinker:
 
         self.base_model_name = base_model
         self.max_seq_length = max_seq_length
+        self.tensor_parallel_size = tensor_parallel_size
 
-        # Determine device
-        if device:
-            self.device = device
-        elif torch.cuda.is_available():
-            self.device = "cuda"
-        else:
-            self.device = "cpu"
+        # Import vLLM here to defer the dependency until use time
+        try:
+            from vllm import LLM, SamplingParams
+        except ImportError:
+            raise ImportError(
+                "vLLM is required for schema linking inference. "
+                "Install with: pip install vllm"
+            )
+
+        self.LLM = LLM
+        self.SamplingParams = SamplingParams
 
         print(f"\n{'='*60}")
-        print(f"Schema Linker Initialization")
+        print(f"Schema Linker Initialization (vLLM)")
         print(f"{'='*60}")
         print(f"  Base model: {base_model}")
         print(f"  Adapter:    {adapter_path}")
-        print(f"  Device:     {self.device}")
+        print(f"  GPUs:       {tensor_parallel_size}")
         print(f"  Max seq len: {max_seq_length}")
         print(f"{'='*60}\n")
-
-        # Load model and tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            base_model,
-            trust_remote_code=True,
-        )
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
-
-        self.model = AutoModelForCausalLM.from_pretrained(
-            base_model,
-            torch_dtype=torch.bfloat16 if BF16 else torch.float16,
-            trust_remote_code=True,
-            device_map="auto" if "cuda" in self.device else None,
-        )
-
-        # Load LoRA adapter
-        self.model = PeftModel.from_pretrained(self.model, str(self.adapter_path))
-        self.model.eval()
-
-        print(f"Model and adapter loaded successfully")
 
     def _format_prompt(self, question: str, schema_text: str) -> str:
         """Format the input prompt using the instruction template."""
@@ -119,130 +101,103 @@ class SchemaLinker:
             schema_text=schema_text,
         )
 
-    def _parse_output(self, generated: str) -> Dict:
-        """
-        Parse the model output into structured JSON.
+    def _create_vllm(self):
+        """Create a vLLM engine instance with LoRA support enabled."""
+        llm = self.LLM(
+            model=self.base_model_name,
+            tensor_parallel_size=self.tensor_parallel_size,
+            max_model_len=self.max_seq_length,
+            dtype="bfloat16",
+            enable_lora=True,
+            max_loras=4,
+            max_lora_rank=LORA_R,
+            enforce_eager=True,
+            trust_remote_code=True,
+            disable_log_stats=True,
+        )
+        return llm
 
-        Handles:
-        - Raw JSON in the response
-        - JSON wrapped in markdown fences
-        - JSON followed by trailing text
-        """
-        # Trim to only the first complete JSON object
-        generated = generated.strip()
+    def _create_sampling_params(self, max_new_tokens: int, lora_path: str):
+        """Create SamplingParams with LoRA path and structured JSON output."""
+        from vllm.lora.request import LoRARequest
 
-        # Remove markdown fences
-        if generated.startswith("```json"):
-            generated = generated[7:]
-        elif generated.startswith("```"):
-            generated = generated[3:]
-        if generated.endswith("```"):
-            generated = generated[:-3].strip()
+        lora_request = LoRARequest("schema_linking", 1, lora_path)
 
-        # Find JSON boundaries
-        start = generated.find("{")
-        if start == -1:
-            return {"error": "No JSON found", "raw": generated[:500]}
+        return self.SamplingParams(
+            max_tokens=max_new_tokens,
+            temperature=0.1,
+            top_p=0.95,
+            lora_request=lora_request,
+            guided_decode_json_schema=json.dumps(OUTPUT_SCHEMA),
+        )
 
-        end = generated.rfind("}") + 1
-        if end <= start:
-            return {"error": "Incomplete JSON", "raw": generated[:500]}
-
-        json_str = generated[start:end]
-
-        try:
-            return json.loads(json_str)
-        except json.JSONDecodeError as e:
-            return {"error": f"JSON parse error: {e}", "raw": json_str[:500]}
-
-    @torch.no_grad()
     def predict(
         self,
         question: str,
         schema_text: str,
         max_new_tokens: int = 512,
-        temperature: float = 0.1,
-        top_p: float = 0.95,
     ) -> Dict:
         """
         Generate schema linking prediction for a single question.
 
-        Args:
-            question: Natural language question
-            schema_text: Database schema in text format
-            max_new_tokens: Maximum tokens to generate
-            temperature: Sampling temperature (low for deterministic output)
-            top_p: Nucleus sampling threshold
-
-        Returns:
-            Dict with structured output:
-            {
-                "tables": [{"name": "...", "reason": "..."}],
-                "columns": [{"name": "...", "reason": "..."}]
-            }
+        Loads the LoRA adapter, generates with forced JSON schema,
+        then unloads the adapter.
         """
-        prompt = self._format_prompt(question, schema_text)
-
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-
-        # Use greedy decoding to avoid numerical instability
-        # from dtype mismatch (trained fp16, loaded bf16)
-        outputs = self.model.generate(
-            **inputs,
+        results = self.predict_batch(
+            [{"question": question, "schema_text": schema_text}],
             max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=self.tokenizer.eos_token_id,
         )
+        return results[0] if results else {}
 
-        # Decode only the generated tokens (skip the prompt)
-        generated = self.tokenizer.decode(
-            outputs[0][inputs["input_ids"].shape[1]:],
-            skip_special_tokens=True,
-        )
-
-        return self._parse_output(generated)
-
-    @torch.no_grad()
     def predict_batch(
         self,
         inputs: List[Dict[str, str]],
         max_new_tokens: int = 512,
-        temperature: float = 0.1,
-        top_p: float = 0.95,
-        batch_size: int = 8,
+        batch_size: int = 16,
         show_progress: bool = True,
     ) -> List[Dict]:
         """
-        Generate schema linking predictions for multiple questions.
+        Generate predictions for multiple questions.
 
-        Args:
-            inputs: List of dicts with "question" and "schema_text" keys
-            max_new_tokens: Maximum tokens to generate per item
-            temperature: Sampling temperature
-            top_p: Nucleus sampling threshold
-            batch_size: Number of items per batch
-            show_progress: Print progress indicator
-
-        Returns:
-            List of structured output dicts (same order as input)
+        Loads the LoRA adapter once for the entire batch,
+        then unloads it when done.
         """
-        results = []
-        total = len(inputs)
+        lora_path = str(self.adapter_path)
+
+        # Create vLLM engine with LoRA support
+        llm = self._create_vllm()
+        sampling_params = self._create_sampling_params(max_new_tokens, lora_path)
+
+        # Format all prompts
+        prompts = [
+            self._format_prompt(item["question"], item["schema_text"])
+            for item in inputs
+        ]
+
+        # Generate in sub-batches for memory efficiency
+        all_results = []
+        total = len(prompts)
 
         for i in range(0, total, batch_size):
-            batch = inputs[i : i + batch_size]
+            batch_prompts = prompts[i : i + batch_size]
+            outputs = llm.generate(batch_prompts, sampling_params)
 
-            for item in batch:
-                question = item.get("question", "")
-                schema_text = item.get("schema_text", "")
-                result = self.predict(question, schema_text, max_new_tokens, temperature, top_p)
-                results.append(result)
+            for output in outputs:
+                response = output.outputs[0].text
+                parsed = self._parse_json_response(response)
+                all_results.append(parsed)
 
             if show_progress:
                 processed = min(i + batch_size, total)
                 print(f"  Processed {processed}/{total}")
 
-        return results
+        # Shut down vLLM engine (unloads LoRA + frees VRAM)
+        if hasattr(llm, "shutdown"):
+            llm.shutdown()
+        elif hasattr(llm, "llm_engine"):
+            llm.llm_engine.shutdown()
+
+        return all_results
 
     def predict_from_db_id(
         self,
@@ -252,21 +207,8 @@ class SchemaLinker:
         max_new_tokens: int = 512,
     ) -> Dict:
         """
-        Convenience method: load schema from db_id + db_root and predict.
-
-        Tries to load schema from JSON files first, then falls back to
-        reading directly from SQLite if no JSON schema is found.
-
-        Args:
-            question: Natural language question
-            db_id: Database identifier (e.g., "singer")
-            db_root: Path to directory containing schema JSON files or SQLite databases
-            max_new_tokens: Maximum tokens to generate
-
-        Returns:
-            Structured output dict
+        Load schema from db_id + db_root and predict.
         """
-        # Try loading from JSON schema files first
         schemas = load_schemas_from_dir(db_root)
         schema = schemas.get(db_id)
 
@@ -274,7 +216,6 @@ class SchemaLinker:
             schema_text = format_schema_compact(schema)
             return self.predict(question, schema_text, max_new_tokens)
 
-        # Fall back to loading from SQLite database directly
         db_path = Path(db_root) / f"{db_id}.sqlite"
         if not db_path.exists():
             return {"error": f"No schema found for db_id '{db_id}' at {db_root}"}
@@ -294,3 +235,27 @@ class SchemaLinker:
         conn.close()
 
         return self.predict(question, schema_text, max_new_tokens)
+
+    @staticmethod
+    def _parse_json_response(response: str) -> Dict:
+        """Parse JSON from a model response."""
+        try:
+            response = response.strip()
+            if response.startswith("```json"):
+                response = response[7:]
+            elif response.startswith("```"):
+                response = response[3:]
+            if response.endswith("```"):
+                response = response[:-3].strip()
+
+            start_idx = response.find("{")
+            if start_idx != -1:
+                end_idx = response.rfind("}") + 1
+                if end_idx > start_idx:
+                    json_str = response[start_idx:end_idx]
+                    return json.loads(json_str)
+
+            return json.loads(response)
+
+        except json.JSONDecodeError as e:
+            return {"error": f"JSON parse error: {e}", "raw": response[:500]}

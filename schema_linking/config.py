@@ -65,7 +65,7 @@ INSTRUCTION_TEMPLATE = (
     "Database Schema:\n{schema_text}"
 )
 
-# Output schema for structured generation
+# Output schema for structured generation (vLLM guided decoding)
 OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -78,6 +78,7 @@ OUTPUT_SCHEMA = {
                     "reason": {"type": "string"},
                 },
                 "required": ["name", "reason"],
+                "additionalProperties": False,
             },
         },
         "columns": {
@@ -89,8 +90,10 @@ OUTPUT_SCHEMA = {
                     "reason": {"type": "string"},
                 },
                 "required": ["name", "reason"],
+                "additionalProperties": False,
             },
         },
     },
     "required": ["tables", "columns"],
+    "additionalProperties": False,
 }
