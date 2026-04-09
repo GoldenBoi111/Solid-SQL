@@ -64,6 +64,12 @@ class SchemaLinker:
             adapter_path = str(Path(OUTPUT_DIR) / "lora_adapter")
 
         self.adapter_path = Path(adapter_path)
+        if not self.adapter_path.is_dir() or not (self.adapter_path / "adapter_config.json").exists():
+            raise FileNotFoundError(
+                f"Adapter not found at '{adapter_path}'. "
+                "Run train.py first, or pass a valid adapter_path."
+            )
+
         self.base_model_name = base_model
         self.max_seq_length = max_seq_length
 
@@ -95,7 +101,7 @@ class SchemaLinker:
 
         self.model = AutoModelForCausalLM.from_pretrained(
             base_model,
-            torch_dtype=torch.float16,
+            torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             device_map="auto" if "cuda" in self.device else None,
         )
