@@ -61,7 +61,7 @@ def tokenize_dataset(
     data: List[Dict],
     tokenizer,
     max_length: int = MAX_SEQ_LENGTH,
-) -> Dict:
+) -> List[Dict]:
     """
     Tokenize the dataset.
 
@@ -69,19 +69,18 @@ def tokenize_dataset(
     (input + output). The model learns to predict output tokens
     given the input prefix via standard next-token prediction.
     """
-    texts = [format_prompt(entry) for entry in data]
-
-    tokenized = tokenizer(
-        texts,
-        truncation=True,
-        max_length=max_length,
-        padding=False,  # Handled by data collator
-        return_tensors=None,  # Return list of dicts for Dataset
-    )
-
-    # Add labels (same as input_ids for causal LM — loss is computed
-    # only on the non-padded portion)
-    tokenized["labels"] = [list(ids) for ids in tokenized["input_ids"]]
+    tokenized = []
+    for entry in data:
+        text = format_prompt(entry)
+        encoding = tokenizer(
+            text,
+            truncation=True,
+            max_length=max_length,
+            return_tensors=None,
+        )
+        # The collator expects dicts with these keys
+        encoding["labels"] = list(encoding["input_ids"])
+        tokenized.append(encoding)
 
     return tokenized
 
