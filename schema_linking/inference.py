@@ -36,7 +36,7 @@ from peft import PeftModel
 
 from .config import (
     MODEL_NAME, OUTPUT_DIR, MAX_SEQ_LENGTH,
-    INSTRUCTION_TEMPLATE,
+    INSTRUCTION_TEMPLATE, BF16,
 )
 from .schema_formatter import format_schema_compact, load_schemas_from_dir
 
@@ -101,7 +101,7 @@ class SchemaLinker:
 
         self.model = AutoModelForCausalLM.from_pretrained(
             base_model,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=torch.bfloat16 if BF16 else torch.float16,
             trust_remote_code=True,
             device_map="auto" if "cuda" in self.device else None,
         )
@@ -185,12 +185,12 @@ class SchemaLinker:
 
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
 
+        # Use greedy decoding to avoid numerical instability
+        # from dtype mismatch (trained fp16, loaded bf16)
         outputs = self.model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            do_sample=temperature > 0,
+            do_sample=False,
             pad_token_id=self.tokenizer.eos_token_id,
         )
 

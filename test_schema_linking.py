@@ -13,8 +13,8 @@ from schema_linking.inference import SchemaLinker
 # Configuration
 # ============================================================
 BASE_MODEL = "openai/gpt-oss-20b"
-ADAPTER_PATH = "./schema_linking_output/lora_adapter"
-VAL_JSONL = "./val.jsonl"
+ADAPTER_PATH = "./schema_linking/schema_linking_output/lora_adapter"
+VAL_JSONL = "./schema_linking/val.jsonl"
 NUM_SAMPLES = 10
 
 
