@@ -34,11 +34,11 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
 
-from config import (
+from .config import (
     MODEL_NAME, OUTPUT_DIR, MAX_SEQ_LENGTH,
     INSTRUCTION_TEMPLATE,
 )
-from schema_formatter import format_schema_compact, load_schemas_from_dir
+from .schema_formatter import format_schema_compact, load_schemas_from_dir
 
 
 class SchemaLinker:
