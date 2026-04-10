@@ -117,17 +117,12 @@ class SchemaLinker:
         )
         return llm
 
-    def _create_sampling_params(self, max_new_tokens: int, lora_path: str):
-        """Create SamplingParams with LoRA path and structured JSON output."""
-        from vllm.lora.request import LoRARequest
-
-        lora_request = LoRARequest("schema_linking", 1, lora_path)
-
+    def _create_sampling_params(self, max_new_tokens: int):
+        """Create SamplingParams with structured JSON output."""
         return self.SamplingParams(
             max_tokens=max_new_tokens,
             temperature=0.1,
             top_p=0.95,
-            lora_request=lora_request,
             guided_decode_json_schema=json.dumps(OUTPUT_SCHEMA),
         )
 
@@ -162,11 +157,14 @@ class SchemaLinker:
         Loads the LoRA adapter once for the entire batch,
         then unloads it when done.
         """
+        from vllm.lora.request import LoRARequest
+
         lora_path = str(self.adapter_path)
 
         # Create vLLM engine with LoRA support
         llm = self._create_vllm()
-        sampling_params = self._create_sampling_params(max_new_tokens, lora_path)
+        sampling_params = self._create_sampling_params(max_new_tokens)
+        lora_request = LoRARequest("schema_linking", 1, lora_path)
 
         # Format all prompts
         prompts = [
@@ -180,7 +178,7 @@ class SchemaLinker:
 
         for i in range(0, total, batch_size):
             batch_prompts = prompts[i : i + batch_size]
-            outputs = llm.generate(batch_prompts, sampling_params)
+            outputs = llm.generate(batch_prompts, sampling_params, lora_request=lora_request)
 
             for output in outputs:
                 response = output.outputs[0].text
