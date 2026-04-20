@@ -121,12 +121,12 @@ class SchemaLinker:
         """Create SamplingParams with structured JSON output."""
         try:
             # vLLM v0.11+
-            from vllm import StructuredOutputsParams
+            from vllm.sampling_params import StructuredOutputsParams
             return self.SamplingParams(
                 max_tokens=max_new_tokens,
                 temperature=0.1,
                 top_p=0.95,
-                structured_outputs=StructuredOutputsParams(json=json.dumps(OUTPUT_SCHEMA)),
+                structured_outputs=StructuredOutputsParams(json=OUTPUT_SCHEMA),
             )
         except ImportError:
             # vLLM < v0.11
@@ -134,7 +134,7 @@ class SchemaLinker:
                 max_tokens=max_new_tokens,
                 temperature=0.1,
                 top_p=0.95,
-                guided_decode_json_schema=json.dumps(OUTPUT_SCHEMA),
+                guided_json=json.dumps(OUTPUT_SCHEMA),
             )
 
     def predict(
