@@ -1,0 +1,62 @@
+[
+    {
+        "question": "How many singers are older than 20?",
+        "sql": "SELECT COUNT(*) FROM Singer WHERE Age > 20",
+        "db_id": "concert_singer"
+    },
+    {
+        "question": "What is the average salary of employees?",
+        "sql": "SELECT AVG(Salary) FROM Employee",
+        "db_id": "employee_dept"
+    },
+    {
+        "question": "List the names of students who scored above 90",
+        "sql": "SELECT Name FROM Student WHERE Score > 90",
+        "db_id": "student_records"
+    },
+    {
+        "question": "Find the department with the highest budget",
+        "sql": "SELECT Department FROM Employee GROUP BY Department ORDER BY SUM(Budget) DESC LIMIT 1",
+        "db_id": "employee_dept"
+    },
+    {
+        "question": "Show all albums by a specific singer",
+        "sql": "SELECT Album.title FROM Album JOIN Singer ON Album.singer_id = Singer.id WHERE Singer.name = ?",
+        "db_id": "concert_singer"
+    },
+    {
+        "question": "How many movies are in the database?",
+        "sql": "SELECT COUNT(*) FROM Movie",
+        "db_id": "movie_db"
+    },
+    {
+        "question": "What is the total revenue?",
+        "sql": "SELECT SUM(Revenue) FROM Sales",
+        "db_id": "sales_db"
+    },
+    {
+        "question": "List all customers who made a purchase",
+        "sql": "SELECT DISTINCT Customer.name FROM Customer JOIN Purchase ON Customer.id = Purchase.customer_id",
+        "db_id": "ecommerce"
+    },
+    {
+        "question": "What is the youngest employee's age?",
+        "sql": "SELECT MIN(Age) FROM Employee",
+        "db_id": "employee_dept"
+    },
+    {
+        "question": "Which department has the most employees?",
+        "sql": "SELECT Department FROM Employee GROUP BY Department ORDER BY COUNT(*) DESC LIMIT 1",
+        "db_id": "employee_dept"
+    },
+    {
+        "question": "Count the number of concerts per singer",
+        "sql": "SELECT Singer.name, COUNT(*) as concert_count FROM Singer JOIN Singer_in_Concert ON Singer.id = Singer_in_Concert.singer_id GROUP BY Singer.name",
+        "db_id": "concert_singer"
+    },
+    {
+        "question": "Find all singers who have performed in concerts",
+        "sql": "SELECT DISTINCT Singer.name FROM Singer JOIN Singer_in_Concert ON Singer.id = Singer_in_Concert.singer_id",
+        "db_id": "concert_singer"
+    }
+]

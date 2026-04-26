@@ -83,6 +83,7 @@ class SkeletonRetriever:
         self.sql_skeletons = []
         self.question_embeddings = None
         self.sql_skeletons_list = []
+        self.sql_embeddings = None
         
         # FAISS indexes
         self.question_index = None
@@ -166,7 +167,7 @@ class SkeletonRetriever:
         # Create FAISS index
         if self.faiss_index_type == "hnsw":
             self.question_index = faiss.IndexHNSWFlat(dim, 32)
-            self.question_index.hsnw.efSearch = 64
+            self.question_index.hnsw.efSearch = 64
         elif self.faiss_index_type == "ivf":
             nlist = 10
             quantizer = faiss.IndexFlatL2(dim)
@@ -193,7 +194,7 @@ class SkeletonRetriever:
         # Create FAISS index
         if self.faiss_index_type == "hnsw":
             self.sql_index = faiss.IndexHNSWFlat(dim, 32)
-            self.sql_index.hsnw.efSearch = 64
+            self.sql_index.hnsw.efSearch = 64
         elif self.faiss_index_type == "ivf":
             nlist = 10
             quantizer = faiss.IndexFlatL2(dim)
@@ -383,73 +384,83 @@ class SkeletonRetriever:
         """
         Save the built index to disk for reuse.
         
+        Saves FAISS indexes as binary files and metadata as JSON.
+        
         Args:
-            path: Path to save the index (JSON file)
+            path: Base path for saving the index
             save_faiss: Whether to save FAISS indexes
         """
         if not self.question_skeletons or not self.sql_skeletons:
             raise ValueError("No index to save. Call build_index() first.")
 
-        # Save FAISS indexes if available
-        faiss_data = None
+        # Create directory for index files
+        index_dir = Path(path).parent
+        index_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save FAISS indexes as binary files
         if save_faiss and FAISS_AVAILABLE:
-            faiss_data = {
-                "question_index": self._save_faiss_index(self.question_index),
-                "sql_index": self._save_faiss_index(self.sql_index),
-            }
+            question_index_path = Path(path).with_suffix(".question.index")
+            sql_index_path = Path(path).with_suffix(".sql.index")
+            
+            if self.question_index is not None:
+                faiss.write_index(self.question_index, str(question_index_path))
+                print(f"Question FAISS index saved to: {question_index_path}")
+            
+            if self.sql_index is not None:
+                faiss.write_index(self.sql_index, str(sql_index_path))
+                print(f"SQL FAISS index saved to: {sql_index_path}")
 
+        # Save metadata as JSON
+        metadata_path = Path(path).with_suffix(".metadata.json")
         index_data = {
             "candidates": self.candidates,
             "question_skeletons": self.question_skeletons,
             "sql_skeletons": self.sql_skeletons,
-            "faiss_data": faiss_data,
         }
-
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        
+        with open(metadata_path, "w", encoding="utf-8") as f:
             json.dump(index_data, f, indent=2, ensure_ascii=False)
-
-        print(f"Index saved to {path}")
-
-    def _save_faiss_index(self, index) -> Optional[bytes]:
-        """Save FAISS index to bytes."""
-        if index is None:
-            return None
-        return faiss.serialize_index(index)
+        
+        print(f"Metadata saved to: {metadata_path}")
+        print(f"Index base path: {path}")
 
     def load_index(self, path: str, load_faiss: bool = True) -> None:
         """
         Load a previously saved index from disk.
         
+        Loads FAISS indexes from binary files and metadata from JSON.
+        
         Args:
-            path: Path to the saved index (JSON file)
+            path: Base path of the saved index
             load_faiss: Whether to load FAISS indexes
         """
-        with open(path, "r", encoding="utf-8") as f:
+        # Load metadata from JSON
+        metadata_path = Path(path).with_suffix(".metadata.json")
+        with open(metadata_path, "r", encoding="utf-8") as f:
             index_data = json.load(f)
 
         self.candidates = index_data["candidates"]
         self.question_skeletons = index_data["question_skeletons"]
         self.sql_skeletons = index_data["sql_skeletons"]
         
-        # Load FAISS indexes if available
-        if load_faiss and FAISS_AVAILABLE and "faiss_data" in index_data:
-            faiss_data = index_data["faiss_data"]
-            if faiss_data:
-                self.question_index = self._load_faiss_index(
-                    faiss_data.get("question_index")
-                )
-                self.sql_index = self._load_faiss_index(
-                    faiss_data.get("sql_index")
-                )
+        # Load FAISS indexes from binary files if available
+        if load_faiss and FAISS_AVAILABLE:
+            question_index_path = Path(path).with_suffix(".question.index")
+            sql_index_path = Path(path).with_suffix(".sql.index")
+            
+            if question_index_path.exists():
+                self.question_index = faiss.read_index(str(question_index_path))
+                print(f"Question FAISS index loaded from: {question_index_path}")
+            else:
+                self.question_index = None
+            
+            if sql_index_path.exists():
+                self.sql_index = faiss.read_index(str(sql_index_path))
+                print(f"SQL FAISS index loaded from: {sql_index_path}")
+            else:
+                self.sql_index = None
 
         print(f"Index loaded from {path} with {len(self.candidates)} examples")
-
-    def _load_faiss_index(self, data: Optional[bytes]) -> Optional[faiss.Index]:
-        """Load FAISS index from bytes."""
-        if data is None:
-            return None
-        return faiss.deserialize_index(data)
 
     def shutdown(self):
         """Shut down vLLM engine and free resources."""
@@ -473,6 +484,8 @@ def load_candidate_library_from_json(path: str) -> List[Dict[str, str]]:
         {"question": "...", "sql": "...", ...},
     ]
     
+    Also supports alternative format with "Question" and "SQL" keys.
+    
     Args:
         path: Path to JSON file
         
@@ -482,9 +495,14 @@ def load_candidate_library_from_json(path: str) -> List[Dict[str, str]]:
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # Validate format
+    # Validate and normalize format
     for i, entry in enumerate(data):
-        if "question" not in entry or "sql" not in entry:
+        # Convert alternative format to standard format
+        if "Question" in entry and "SQL" in entry:
+            entry["question"] = entry.pop("Question")
+            entry["sql"] = entry.pop("SQL")
+        # Validate format
+        elif "question" not in entry or "sql" not in entry:
             raise ValueError(
                 f"Entry {i} missing 'question' or 'sql' field. "
                 f"Found keys: {list(entry.keys())}"
