@@ -1,8 +1,8 @@
 """
-Schema Linking Inference (Transformers + LoRA)
+Schema Linking Inference (Outlines + LoRA)
 
-Uses Hugging Face transformers with a single model instance that
-dynamically loads/unloads LoRA adapter for schema linking.
+Uses Outlines with a single model instance that dynamically
+loads/unloads the LoRA adapter for schema linking.
 
 Usage:
     from schema_linking.inference import SchemaLinker
@@ -25,12 +25,12 @@ Usage:
     )
 """
 
-import json
 from pathlib import Path
-from typing import List, Dict, Optional, Union
+from typing import List, Dict, Optional
 
+import outlines
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from pydantic import BaseModel
 
 from .config import (
     MODEL_NAME,
@@ -43,8 +43,27 @@ from .config import (
 from .schema_formatter import format_schema_compact, load_schemas_from_dir
 
 
+class SchemaLinkingTable(BaseModel):
+    name: str
+    reason: str
+
+
+class SchemaLinkingColumn(BaseModel):
+    name: str
+    reason: str
+
+
+class SchemaLinkingOutput(BaseModel):
+    tables: List[SchemaLinkingTable]
+    columns: List[SchemaLinkingColumn]
+
+
+class SQLOutput(BaseModel):
+    sql: str
+
+
 class SchemaLinker:
-    """Uses a single transformers model with dynamic LoRA loading."""
+    """Uses a single Outlines model with dynamic LoRA loading."""
 
     def __init__(
         self,
@@ -73,11 +92,13 @@ class SchemaLinker:
         self.max_seq_length = max_seq_length
         self._model = None
         self._tokenizer = None
+        self._schema_linking_generator = None
+        self._sql_generator = None
         self._lora_loaded = False  # True once the adapter has been loaded (never resets)
         self._lora_active = False   # True when adapter is currently applied
 
         print(f"\n{'='*60}")
-        print(f"Schema Linker Initialization (Transformers)")
+        print(f"Schema Linker Initialization (Outlines)")
         print(f"{'='*60}")
         print(f"  Base model: {base_model}")
         print(f"  Adapter:    {adapter_path if self.has_adapter else 'None'}")
@@ -88,31 +109,33 @@ class SchemaLinker:
         """Load the base model and tokenizer."""
         if self._model is None:
             print("Loading base model...")
-            self._tokenizer = AutoTokenizer.from_pretrained(
+            self._model = outlines.models.transformers(
                 self.base_model_name,
-                trust_remote_code=True,
+                device="cuda",
+                model_kwargs={"dtype": torch.bfloat16, "device_map": "auto"},
             )
+            self._tokenizer = self._model.tokenizer
 
-            # Set pad token if not set
-            if self._tokenizer.pad_token is None:
-                self._tokenizer.pad_token = self._tokenizer.eos_token
-
-            # Load model with automatic device placement
-            self._model = AutoModelForCausalLM.from_pretrained(
-                self.base_model_name,
-                trust_remote_code=True,
-                torch_dtype=torch.bfloat16,
-                device_map="auto",
-            )
-
-            # If adapter exists, load it onto the model before use
+            # Outlines wraps the underlying nn.Module; attach adapters there.
             if self.has_adapter and not self._lora_loaded:
                 print("Loading LoRA adapter (first time)...")
-                self._model.load_adapter(str(self.adapter_path), adapter_name="lora_adapter")
+                self._model.model.load_adapter(
+                    str(self.adapter_path),
+                    adapter_name="lora_adapter",
+                )
                 self._lora_loaded = True
 
-            # Set model to eval mode
-            self._model.eval()
+            self._model.model.eval()
+            if self._schema_linking_generator is None:
+                self._schema_linking_generator = outlines.generate.json(
+                    self._model,
+                    SchemaLinkingOutput,
+                )
+            if self._sql_generator is None:
+                self._sql_generator = outlines.generate.json(
+                    self._model,
+                    SQLOutput,
+                )
             print("Base model loaded.")
 
     def _load_lora(self):
@@ -121,15 +144,15 @@ class SchemaLinker:
             return
         
         # Adapter is already loaded in _load_model, just activate it
-        self._model.enable_adapters()
-        self._model.set_adapter("lora_adapter")
+        self._model.model.enable_adapters()
+        self._model.model.set_adapter("lora_adapter")
         self._lora_active = True
 
     def _unload_lora(self):
         """Disable the LoRA adapter (keep it loaded but don't use it)."""
         if self._lora_active:
             # Disable the active adapter without unloading its weights
-            self._model.disable_adapters()
+            self._model.model.disable_adapters()
             self._lora_active = False
             print("LoRA adapter disabled (kept in memory).")
 
@@ -139,17 +162,6 @@ class SchemaLinker:
             question=question,
             schema_text=schema_text,
         )
-
-    def _create_sampling_params(self, max_new_tokens: int):
-        """Create generation parameters."""
-        return {
-            "max_new_tokens": max_new_tokens,
-            "temperature": 0.1,
-            "top_p": 0.95,
-            "do_sample": True,
-            "pad_token_id": self._tokenizer.pad_token_id,
-            "eos_token_id": self._tokenizer.eos_token_id,
-        }
 
     def predict(
         self,
@@ -193,37 +205,21 @@ class SchemaLinker:
         ]
 
         # Tokenize
-        inputs_tokenized = self._tokenizer(
-            prompts,
-            padding=True,
-            truncation=True,
-            max_length=self.max_seq_length,
-            return_tensors="pt",
-        ).to(self._model.device)
-
-        # Generate
         all_results = []
         total = len(prompts)
 
-        with torch.no_grad():
-            for i in range(0, total, batch_size):
-                batch_inputs = {
-                    k: v[i : i + batch_size] for k, v in inputs_tokenized.items()
-                }
-
-                outputs = self._model.generate(
-                    **batch_inputs,
-                    **self._create_sampling_params(max_new_tokens),
+        for i in range(0, total, batch_size):
+            batch_prompts = prompts[i : i + batch_size]
+            for prompt in batch_prompts:
+                output = self._schema_linking_generator(
+                    prompt,
+                    max_tokens=max_new_tokens,
                 )
+                all_results.append(self._output_to_dict(output))
 
-                for output in outputs:
-                    response = self._tokenizer.decode(output, skip_special_tokens=True)
-                    parsed = self._parse_json_response(response)
-                    all_results.append(parsed)
-
-                if show_progress:
-                    processed = min(i + batch_size, total)
-                    print(f"  Processed {processed}/{total}")
+            if show_progress:
+                processed = min(i + batch_size, total)
+                print(f"  Processed {processed}/{total}")
 
         # Keep LoRA adapter loaded - don't unload to avoid memory fragmentation
         # The adapter weights are small compared to the base model
@@ -256,38 +252,21 @@ class SchemaLinker:
         if self._lora_active:
             self._unload_lora()
 
-        # Tokenize
-        inputs_tokenized = self._tokenizer(
-            prompts,
-            padding=True,
-            truncation=True,
-            max_length=self.max_seq_length,
-            return_tensors="pt",
-        ).to(self._model.device)
-
-        # Generate
         all_outputs = []
         total = len(prompts)
 
-        with torch.no_grad():
-            for i in range(0, total, batch_size):
-                batch_inputs = {
-                    k: v[i : i + batch_size] for k, v in inputs_tokenized.items()
-                }
-
-                outputs = self._model.generate(
-                    **batch_inputs,
-                    **self._create_sampling_params(max_new_tokens),
+        for i in range(0, total, batch_size):
+            batch_prompts = prompts[i : i + batch_size]
+            for prompt in batch_prompts:
+                output = self._sql_generator(
+                    prompt,
+                    max_tokens=max_new_tokens,
                 )
+                all_outputs.append(output.sql)
 
-                for output in outputs:
-                    all_outputs.append(
-                        self._tokenizer.decode(output, skip_special_tokens=True)
-                    )
-
-                if show_progress:
-                    processed = min(i + batch_size, total)
-                    print(f"  Processed {processed}/{total}")
+            if show_progress:
+                processed = min(i + batch_size, total)
+                print(f"  Processed {processed}/{total}")
 
         return all_outputs
 
@@ -301,6 +280,8 @@ class SchemaLinker:
         if self._tokenizer is not None:
             del self._tokenizer
             self._tokenizer = None
+        self._schema_linking_generator = None
+        self._sql_generator = None
         self._lora_loaded = False
 
     def predict_from_db_id(
@@ -344,25 +325,12 @@ class SchemaLinker:
         return self.predict(question, schema_text, max_new_tokens)
 
     @staticmethod
-    def _parse_json_response(response: str) -> Dict:
-        """Parse JSON from a model response."""
-        try:
-            response = response.strip()
-            if response.startswith("```json"):
-                response = response[7:]
-            elif response.startswith("```"):
-                response = response[3:]
-            if response.endswith("```"):
-                response = response[:-3].strip()
-
-            start_idx = response.find("{")
-            if start_idx != -1:
-                end_idx = response.rfind("}") + 1
-                if end_idx > start_idx:
-                    json_str = response[start_idx:end_idx]
-                    return json.loads(json_str)
-
-            return json.loads(response)
-
-        except json.JSONDecodeError as e:
-            return {"error": f"JSON parse error: {e}", "raw": response[:500]}
+    def _output_to_dict(output) -> Dict:
+        """Convert an Outlines output object to a plain dictionary."""
+        if hasattr(output, "model_dump"):
+            return output.model_dump()
+        if hasattr(output, "dict"):
+            return output.dict()
+        if isinstance(output, dict):
+            return output
+        return {"error": f"Unexpected output type: {type(output).__name__}"}

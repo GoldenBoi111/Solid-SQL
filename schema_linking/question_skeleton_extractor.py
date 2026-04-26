@@ -84,11 +84,16 @@ class QuestionSkeletonExtractor:
             model_name: Hugging Face model name or local path
             max_seq_length: Maximum sequence length
             shared_model: Optional shared model instance to reuse
+                (can be an Outlines wrapper or raw transformers model)
             shared_tokenizer: Optional shared tokenizer instance to reuse
         """
         self.model_name = model_name
         self.max_seq_length = max_seq_length
-        self._model = shared_model  # Use shared model if provided
+        # Reuse the underlying transformers model when an Outlines wrapper is passed.
+        if shared_model is not None and not hasattr(shared_model, "generate") and hasattr(shared_model, "model"):
+            self._model = shared_model.model
+        else:
+            self._model = shared_model
         self._tokenizer = shared_tokenizer  # Use shared tokenizer if provided
 
     def _load_model(self):
