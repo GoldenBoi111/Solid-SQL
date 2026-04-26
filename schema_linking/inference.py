@@ -111,7 +111,7 @@ class SchemaLinker:
             enable_lora=True,
             max_loras=4,
             max_lora_rank=LORA_R,
-            enforce_eager=True,
+            enforce_eager=False,
             trust_remote_code=True,
             disable_log_stats=True,
         )
