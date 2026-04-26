@@ -112,8 +112,10 @@ class SchemaLinker:
         if not self.has_adapter:
             return
         
-        # Check if adapter is already loaded (PeftModel wrapper exists)
-        if self._lora_loaded:
+        from peft import PeftModel
+        
+        # Check if model is already a PeftModel (adapter already loaded)
+        if isinstance(self._model, PeftModel):
             # Adapter already loaded, just activate it
             self._model.enable_adapters()
             self._model.set_adapter("lora_adapter")
@@ -123,7 +125,6 @@ class SchemaLinker:
         
         # Adapter not loaded, load it
         print("Loading LoRA adapter...")
-        from peft import PeftModel
         
         # Wrap model with PeftModel and load adapter
         self._model = PeftModel.from_pretrained(
@@ -131,6 +132,7 @@ class SchemaLinker:
             str(self.adapter_path),
             adapter_name="lora_adapter",
         )
+        
         # Set active adapter to use LoRA
         self._model.enable_adapters()
         self._model.set_adapter("lora_adapter")
