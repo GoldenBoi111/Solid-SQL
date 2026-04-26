@@ -110,11 +110,11 @@ class SchemaLinker:
         if not self.has_adapter:
             return
             
-        # Check if adapter is already loaded by checking active adapters
-        if hasattr(self._model, "active_adapters"):
-            if "lora_adapter" in self._model.active_adapters:
-                # Adapter already loaded and active
-                return
+        # Check if adapter is already loaded
+        if self._lora_loaded:
+            # Adapter already loaded, just ensure it's active
+            self._model.set_adapter("lora_adapter")
+            return
         
         # Adapter not loaded, load it
         print("Loading LoRA adapter...")
