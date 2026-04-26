@@ -94,55 +94,11 @@ class SolidSQL:
         if candidate_examples and build_index:
             self.retriever.build_index(show_progress=False)
             
-        # Initialize SchemaLinker without LLM (will be set later)
+        # Single SchemaLinker instance that switches between LoRA and base model
         self.schema_linker = SchemaLinker(
             base_model=base_model,
             adapter_path=adapter_path,
-            llm_instance=None,  # Will be set when needed
         )
-        
-        # Shared LLM instance (loaded once, reused for all tasks)
-        self._llm_instance = None
-        self._lora_request = None
-        self._initialized = False
-
-    def _init_llm(self):
-        """Initialize the shared LLM instance (called once, reused for all tasks)."""
-        if self._initialized:
-            return
-            
-        from vllm import LLM, SamplingParams
-        from vllm.lora.request import LoRARequest
-        
-        print("\n" + "="*60)
-        print("Initializing shared LLM engine (loaded once)")
-        print("="*60)
-        
-        self._llm_instance = LLM(
-            model=self.base_model,
-            tensor_parallel_size=1,
-            max_model_len=2048,
-            dtype="bfloat16",
-            enable_lora=True,
-            max_loras=4,
-            max_lora_rank=64,
-            enforce_eager=True,
-            trust_remote_code=True,
-            disable_log_stats=True,
-            gpu_memory_utilization=0.85,
-            max_num_batched_tokens=16384,
-            max_num_seqs=256,
-        )
-        
-        self._lora_request = LoRARequest("schema_linking", 1, self.adapter_path)
-        self._initialized = True
-        
-        # Update schema linker with the shared LLM
-        self.schema_linker._llm = self._llm_instance
-        self.schema_linker._lora_request = self._lora_request
-        
-        print(f"LLM initialized successfully")
-        print("="*60 + "\n")
 
     def generate_sql(
         self,
@@ -165,9 +121,6 @@ class SolidSQL:
         Returns:
             Dictionary with full generation results including intermediate steps
         """
-        # Initialize LLM on first use
-        self._init_llm()
-        
         # Step 1: Schema linking with LoRA adapter
         schema_result = self.schema_linker.predict(
             question=question,
@@ -187,8 +140,8 @@ class SolidSQL:
         if not self.skip_skeleton_extraction and self.q_extractor is not None:
             question_skeleton = self.q_extractor.extract(question)
         elif self.skip_skeleton_extraction:
-            # Use the SchemaLinker's LLM for question skeleton extraction
-            question_skeleton = self._extract_skeleton_with_shared_llm(question)
+            # Use the base model LLM for question skeleton extraction
+            question_skeleton = self._extract_skeleton_with_base_model(question)
 
         # Step 3: Retrieve similar examples
         if self.retriever.question_skeletons:  # Only if index built
@@ -223,7 +176,7 @@ class SolidSQL:
                 "Generate the refined SQL query:\n"
             )
             
-            # Generate SQL using the schema linker's LLM without LoRA adapter
+            # Generate SQL using the base model without LoRA adapter
             try:
                 outputs = self.schema_linker.generate_without_lora(
                     [round_2_prompt],
@@ -340,13 +293,13 @@ class SolidSQL:
         """
         self.retriever.load_index(path, question_index_path=question_index_path, sql_index_path=sql_index_path)
             
-    def _extract_skeleton_with_shared_llm(self, question: str) -> str:
-        """Extract question skeleton using the SchemaLinker's shared LLM."""
+    def _extract_skeleton_with_base_model(self, question: str) -> str:
+        """Extract question skeleton using the base model LLM."""
         from schema_linking.question_skeleton_extractor import SKELETON_EXTRACTION_PROMPT
         
         skeleton_prompt = SKELETON_EXTRACTION_PROMPT.format(question=question)
         
-        # Use the SchemaLinker's LLM without LoRA adapter
+        # Use the base model LLM without LoRA adapter
         try:
             outputs = self.schema_linker.generate_without_lora(
                 [skeleton_prompt],
@@ -360,9 +313,9 @@ class SolidSQL:
                 skeleton = self._clean_skeleton_response(skeleton)
                 return skeleton
         except Exception as e:
-            print(f"Warning: Failed to extract skeleton with shared LLM: {e}")
+            print(f"Warning: Failed to extract skeleton with base model: {e}")
         
-        # Fallback to regular extractor if shared LLM fails
+        # Fallback to regular extractor if base model fails
         if self.q_extractor is not None:
             return self.q_extractor.extract(question)
         return ""
@@ -385,9 +338,15 @@ class SolidSQL:
             
     def _generate_sql_with_base_model(self, question: str, schema_text: str, max_new_tokens: int = 512) -> str:
         """
-        Generate SQL using the schema linker's LLM without LoRA adapter.
+        Generate SQL using the base model without LoRA adapter.
         
-        Reuses the same LLM instance from schema linking to avoid reloading.
+        Args:
+            question: Natural language question
+            schema_text: Database schema text
+            max_new_tokens: Maximum tokens to generate
+            
+        Returns:
+            Generated SQL string
         """
         # SQL generation prompt
         sql_prompt = (
@@ -402,7 +361,7 @@ class SolidSQL:
             "SQL:\n"
         ).format(question=question, schema_text=schema_text)
         
-        # Use the SchemaLinker's generate_without_lora method
+        # Use the base model's generate_without_lora method
         try:
             outputs = self.schema_linker.generate_without_lora(
                 [sql_prompt],
@@ -416,7 +375,7 @@ class SolidSQL:
             else:
                 sql = ""
         except Exception as e:
-            print(f"Warning: Failed to generate SQL with shared LLM: {e}")
+            print(f"Warning: Failed to generate SQL with base model: {e}")
             sql = ""
         
         return sql
@@ -461,13 +420,6 @@ class SolidSQL:
         """Shut down the schema linker to free resources."""
         if hasattr(self, 'schema_linker'):
             self.schema_linker.shutdown()
-        # Also shutdown the shared LLM if we own it
-        if hasattr(self, '_llm_instance') and self._llm_instance is not None:
-            try:
-                self._llm_instance.shutdown()
-            except:
-                pass
-            self._llm_instance = None
     
     def __del__(self):
         """Ensure resources are freed on deletion."""

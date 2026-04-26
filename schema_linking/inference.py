@@ -1,32 +1,36 @@
 """
-Schema Linking Inference (vLLM + LoRA)
+Schema Linking Inference (Transformers + LoRA)
 
-Uses vLLM with forced JSON schema output and dynamic LoRA adapter loading
-to predict relevant tables and columns from a question and database schema.
-
-The LoRA adapter is loaded per-prediction-batch and unloaded after,
-so the base model stays clean for other tasks.
+Uses Hugging Face transformers with a single model instance that
+dynamically loads/unloads LoRA adapter for schema linking.
 
 Usage:
     from schema_linking.inference import SchemaLinker
 
-    # With shared LLM instance
     linker = SchemaLinker(
         base_model="openai/gpt-oss-20b",
         adapter_path="./schema_linking_output/lora_adapter",
-        llm_instance=shared_llm,  # Pass pre-created LLM
     )
 
-    # Single prediction
+    # Schema linking with LoRA
     result = linker.predict(
         question="How many singers are older than 20?",
         schema_text="Singer(id, name, age)\nAlbum(id, singer_id, title)",
+    )
+
+    # SQL generation without LoRA
+    outputs = linker.generate_without_lora(
+        ["Generate SQL for: ..."],
+        max_new_tokens=512,
     )
 """
 
 import json
 from pathlib import Path
 from typing import List, Dict, Optional, Union
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import (
     MODEL_NAME, OUTPUT_DIR, MAX_SEQ_LENGTH,
@@ -37,15 +41,13 @@ from .schema_formatter import format_schema_compact, load_schemas_from_dir
 
 
 class SchemaLinker:
-    """Uses vLLM with a LoRA adapter and forced JSON schema for inference."""
+    """Uses a single transformers model with dynamic LoRA loading."""
 
     def __init__(
         self,
         base_model: str = MODEL_NAME,
         adapter_path: str = "",
-        tensor_parallel_size: int = 1,
         max_seq_length: int = MAX_SEQ_LENGTH,
-        llm_instance: object = None,
     ):
         """
         Initialize the schema linker.
@@ -53,53 +55,75 @@ class SchemaLinker:
         Args:
             base_model: Hugging Face model name or local path
             adapter_path: Path to the fine-tuned LoRA adapter directory
-            tensor_parallel_size: Number of GPUs for tensor parallelism
             max_seq_length: Maximum sequence length (prompt + output)
-            llm_instance: Optional pre-created LLM instance to reuse (for shared model loading)
         """
         if not adapter_path:
             adapter_path = str(Path(OUTPUT_DIR) / "lora_adapter")
 
         self.adapter_path = Path(adapter_path)
-        if not self.adapter_path.is_dir() or not (self.adapter_path / "adapter_config.json").exists():
-            raise FileNotFoundError(
-                f"Adapter not found at '{adapter_path}'. "
-                "Run train.py first, or pass a valid adapter_path."
-            )
-
+        self.has_adapter = self.adapter_path.is_dir() and (self.adapter_path / "adapter_config.json").exists()
+        
         self.base_model_name = base_model
         self.max_seq_length = max_seq_length
-        self.tensor_parallel_size = tensor_parallel_size
-        self._llm = llm_instance  # Use provided instance or create new one
-        self._lora_request = None
-        self._own_llm = llm_instance is None  # Track if we own the LLM instance
-
-        # Import vLLM here to defer the dependency until use time
-        try:
-            from vllm import LLM, SamplingParams
-            from vllm.lora.request import LoRARequest
-        except ImportError:
-            raise ImportError(
-                "vLLM is required for schema linking inference. "
-                "Install with: pip install vllm"
-            )
-
-        self.LLM = LLM
-        self.SamplingParams = SamplingParams
-        self.LoRARequest = LoRARequest
-
-        # Create LoRA request for schema linking
-        self._lora_request = self.LoRARequest("schema_linking", 1, str(self.adapter_path))
+        self._model = None
+        self._tokenizer = None
+        self._lora_loaded = False
 
         print(f"\n{'='*60}")
-        print(f"Schema Linker Initialization (vLLM)")
+        print(f"Schema Linker Initialization (Transformers)")
         print(f"{'='*60}")
         print(f"  Base model: {base_model}")
-        print(f"  Adapter:    {adapter_path}")
-        print(f"  GPUs:       {tensor_parallel_size}")
+        print(f"  Adapter:    {adapter_path if self.has_adapter else 'None'}")
         print(f"  Max seq len: {max_seq_length}")
-        print(f"  Shared LLM: {llm_instance is not None}")
         print(f"{'='*60}\n")
+
+    def _load_model(self):
+        """Load the base model and tokenizer."""
+        if self._model is None:
+            print("Loading base model...")
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self.base_model_name,
+                trust_remote_code=True,
+            )
+            
+            # Set pad token if not set
+            if self._tokenizer.pad_token is None:
+                self._tokenizer.pad_token = self._tokenizer.eos_token
+            
+            self._model = AutoModelForCausalLM.from_pretrained(
+                self.base_model_name,
+                trust_remote_code=True,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+            )
+            self._model.eval()
+            print("Base model loaded.")
+
+    def _load_lora(self):
+        """Load the LoRA adapter into the model."""
+        if self.has_adapter and not self._lora_loaded:
+            print("Loading LoRA adapter...")
+            from peft import PeftModel
+            
+            self._model = PeftModel.from_pretrained(
+                self._model,
+                str(self.adapter_path),
+                adapter_name="schema_linking",
+            )
+            self._model.set_adapter("schema_linking")
+            self._lora_loaded = True
+            print("LoRA adapter loaded.")
+
+    def _unload_lora(self):
+        """Unload the LoRA adapter from the model."""
+        if self._lora_loaded:
+            print("Unloading LoRA adapter...")
+            from peft import PeftModel
+            
+            if hasattr(self._model, "delete_adapter"):
+                self._model.delete_adapter("schema_linking")
+            self._lora_loaded = False
+            print("LoRA adapter unloaded.")
 
     def _format_prompt(self, question: str, schema_text: str) -> str:
         """Format the input prompt using the instruction template."""
@@ -108,36 +132,16 @@ class SchemaLinker:
             schema_text=schema_text,
         )
 
-    def _get_llm(self):
-        """Get the vLLM engine instance (should be created externally and shared)."""
-        return self._llm
-
-    def _create_sampling_params(self, max_new_tokens: int, use_lora: bool = True):
-        """Create SamplingParams with structured JSON output."""
-        if use_lora:
-            try:
-                # vLLM v0.11+
-                from vllm.sampling_params import StructuredOutputsParams
-                return self.SamplingParams(
-                    max_tokens=max_new_tokens,
-                    temperature=0.1,
-                    top_p=0.95,
-                    structured_outputs=StructuredOutputsParams(json=OUTPUT_SCHEMA),
-                )
-            except ImportError:
-                # vLLM < v0.11
-                return self.SamplingParams(
-                    max_tokens=max_new_tokens,
-                    temperature=0.1,
-                    top_p=0.95,
-                    guided_json=json.dumps(OUTPUT_SCHEMA),
-                )
-        else:
-            return self.SamplingParams(
-                max_tokens=max_new_tokens,
-                temperature=0.1,
-                top_p=0.95,
-            )
+    def _create_sampling_params(self, max_new_tokens: int):
+        """Create generation parameters."""
+        return {
+            "max_new_tokens": max_new_tokens,
+            "temperature": 0.1,
+            "top_p": 0.95,
+            "do_sample": True,
+            "pad_token_id": self._tokenizer.pad_token_id,
+            "eos_token_id": self._tokenizer.eos_token_id,
+        }
 
     def predict(
         self,
@@ -148,7 +152,7 @@ class SchemaLinker:
         """
         Generate schema linking prediction for a single question.
 
-        Uses the shared LLM with LoRA adapter loaded.
+        Loads the LoRA adapter, generates, then unloads it.
         """
         results = self.predict_batch(
             [{"question": question, "schema_text": schema_text}],
@@ -166,14 +170,13 @@ class SchemaLinker:
         """
         Generate predictions for multiple questions.
 
-        Reuses the same LLM instance with LoRA adapter loaded.
+        Loads LoRA adapter once, generates all batches, then unloads.
         """
-        # Get the shared LLM instance
-        llm = self._get_llm()
-        if llm is None:
-            raise RuntimeError("No LLM instance available. Initialize SolidSQL first.")
-            
-        sampling_params = self._create_sampling_params(max_new_tokens, use_lora=True)
+        # Load base model
+        self._load_model()
+        
+        # Load LoRA adapter
+        self._load_lora()
 
         # Format all prompts
         prompts = [
@@ -181,22 +184,41 @@ class SchemaLinker:
             for item in inputs
         ]
 
-        # Generate in sub-batches for memory efficiency
+        # Tokenize
+        inputs_tokenized = self._tokenizer(
+            prompts,
+            padding=True,
+            truncation=True,
+            max_length=self.max_seq_length,
+            return_tensors="pt",
+        ).to(self._model.device)
+
+        # Generate
         all_results = []
         total = len(prompts)
 
-        for i in range(0, total, batch_size):
-            batch_prompts = prompts[i : i + batch_size]
-            outputs = llm.generate(batch_prompts, sampling_params, lora_request=self._lora_request)
+        with torch.no_grad():
+            for i in range(0, total, batch_size):
+                batch_inputs = {
+                    k: v[i : i + batch_size] for k, v in inputs_tokenized.items()
+                }
+                
+                outputs = self._model.generate(
+                    **batch_inputs,
+                    **self._create_sampling_params(max_new_tokens),
+                )
+                
+                for output in outputs:
+                    response = self._tokenizer.decode(output, skip_special_tokens=True)
+                    parsed = self._parse_json_response(response)
+                    all_results.append(parsed)
 
-            for output in outputs:
-                response = output.outputs[0].text
-                parsed = self._parse_json_response(response)
-                all_results.append(parsed)
+                if show_progress:
+                    processed = min(i + batch_size, total)
+                    print(f"  Processed {processed}/{total}")
 
-            if show_progress:
-                processed = min(i + batch_size, total)
-                print(f"  Processed {processed}/{total}")
+        # Unload LoRA adapter
+        self._unload_lora()
 
         return all_results
 
@@ -210,8 +232,6 @@ class SchemaLinker:
         """
         Generate text using the base model WITHOUT LoRA adapter.
         
-        Reuses the same LLM instance but without loading the LoRA adapter.
-        
         Args:
             prompts: List of prompt strings to generate from
             max_new_tokens: Maximum tokens to generate
@@ -221,43 +241,55 @@ class SchemaLinker:
         Returns:
             List of generated text strings
         """
-        # Get the shared LLM instance
-        llm = self._get_llm()
-        if llm is None:
-            raise RuntimeError("No LLM instance available. Initialize SolidSQL first.")
-            
-        sampling_params = self._create_sampling_params(max_new_tokens, use_lora=False)
+        # Load base model (without LoRA)
+        self._load_model()
 
-        # Generate in sub-batches for memory efficiency
+        # Ensure LoRA is not loaded
+        if self._lora_loaded:
+            self._unload_lora()
+
+        # Tokenize
+        inputs_tokenized = self._tokenizer(
+            prompts,
+            padding=True,
+            truncation=True,
+            max_length=self.max_seq_length,
+            return_tensors="pt",
+        ).to(self._model.device)
+
+        # Generate
         all_outputs = []
         total = len(prompts)
 
-        for i in range(0, total, batch_size):
-            batch_prompts = prompts[i : i + batch_size]
-            outputs = llm.generate(batch_prompts, sampling_params, lora_request=None)
+        with torch.no_grad():
+            for i in range(0, total, batch_size):
+                batch_inputs = {
+                    k: v[i : i + batch_size] for k, v in inputs_tokenized.items()
+                }
+                
+                outputs = self._model.generate(
+                    **batch_inputs,
+                    **self._create_sampling_params(max_new_tokens),
+                )
+                
+                for output in outputs:
+                    all_outputs.append(self._tokenizer.decode(output, skip_special_tokens=True))
 
-            for output in outputs:
-                all_outputs.append(output.outputs[0].text)
-
-            if show_progress:
-                processed = min(i + batch_size, total)
-                print(f"  Processed {processed}/{total}")
+                if show_progress:
+                    processed = min(i + batch_size, total)
+                    print(f"  Processed {processed}/{total}")
 
         return all_outputs
 
-    def set_keep_alive(self, keep_alive: bool = True):
-        """Set whether to keep the LLM alive between calls."""
-        self._keep_alive = keep_alive
-
     def shutdown(self):
-        """Shut down the LLM engine to free resources (only if we own it)."""
-        if hasattr(self, '_own_llm') and self._own_llm and hasattr(self, '_llm') and self._llm is not None:
-            try:
-                self._llm.shutdown()
-            except:
-                pass
-            self._llm = None
-            self._lora_request = None
+        """Shut down the model to free resources."""
+        if self._model is not None:
+            del self._model
+            self._model = None
+        if self._tokenizer is not None:
+            del self._tokenizer
+            self._tokenizer = None
+        self._lora_loaded = False
 
     def predict_from_db_id(
         self,
