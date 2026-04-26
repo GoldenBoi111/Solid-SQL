@@ -91,6 +91,26 @@ class QuestionSkeletonExtractor:
         self._model = shared_model  # Use shared model if provided
         self._tokenizer = shared_tokenizer  # Use shared tokenizer if provided
 
+    def _load_model(self):
+        """Load the base model and tokenizer if not already loaded."""
+        if self._model is None:
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self.model_name,
+                trust_remote_code=True,
+            )
+            
+            # Set pad token if not set
+            if self._tokenizer.pad_token is None:
+                self._tokenizer.pad_token = self._tokenizer.eos_token
+            
+            self._model = AutoModelForCausalLM.from_pretrained(
+                self.model_name,
+                trust_remote_code=True,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+            )
+            self._model.eval()
+
     def _format_prompt(self, question: str) -> str:
         """Format the prompt for skeleton extraction."""
         return SKELETON_EXTRACTION_PROMPT.format(question=question)
