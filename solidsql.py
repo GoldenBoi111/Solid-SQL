@@ -82,6 +82,14 @@ build_index: bool = True,
             
         self.sql_extractor = SQLSkeletonExtractor(dialect=sql_dialect)
         self.similarity = SkeletonSimilarity(embedding_model=embedding_model)
+        
+        # Initialize base model for SQL generation (shared across all questions)
+        self.base_model_llm = None
+        self.base_model = base_model
+        
+        # Initialize base model for SQL generation (shared across all questions)
+        self.base_model_llm = None
+        self.base_model = base_model
 
         # Initialize retrieval system
         self.retriever = SkeletonRetriever(
@@ -181,18 +189,10 @@ build_index: bool = True,
             
             # Generate SQL using the base model without LoRA adapter
             try:
-                from vllm import LLM, SamplingParams
+                from vllm import SamplingParams
                 
-                # Create LLM without LoRA adapter for SQL generation
-                sql_generator = LLM(
-                    model=self.base_model,
-                    tensor_parallel_size=1,
-                    max_model_len=4096,
-                    dtype="bfloat16",
-                    enforce_eager=False,
-                    trust_remote_code=True,
-                    disable_log_stats=True,
-                )
+                # Use shared LLM instance
+                sql_generator = self._get_base_model_llm()
                 
                 sampling_params = SamplingParams(
                     max_tokens=512,
@@ -207,12 +207,6 @@ build_index: bool = True,
                     refined_sql = outputs[0].outputs[0].text.strip()
                     # Clean up the SQL output
                     refined_sql = self._clean_sql_output(refined_sql)
-                
-                # Shutdown the SQL generator to free resources
-                if hasattr(sql_generator, "shutdown"):
-                    sql_generator.shutdown()
-                elif hasattr(sql_generator, "llm_engine"):
-                    sql_generator.llm_engine.shutdown()
                     
             except Exception as e:
                 print(f"Warning: Failed to generate refined SQL: {e}")
@@ -331,14 +325,28 @@ build_index: bool = True,
                 return self.q_extractor.extract(question)
             return ""
             
+    def _get_base_model_llm(self):
+        """Get or create the shared base model LLM instance."""
+        if self.base_model_llm is None:
+            from vllm import LLM
+            self.base_model_llm = LLM(
+                model=self.base_model,
+                tensor_parallel_size=1,
+                max_model_len=4096,
+                dtype="bfloat16",
+                enforce_eager=False,
+                trust_remote_code=True,
+                disable_log_stats=True,
+            )
+        return self.base_model_llm
+    
     def _generate_sql_with_base_model(self, question: str, schema_text: str, max_new_tokens: int = 512) -> str:
         """
         Generate SQL using the base model without LoRA adapter.
         
-        This method creates a custom prompt for SQL generation and uses
-        the base model (without LoRA adapter) for generation.
+        Uses a shared LLM instance to avoid reloading for each question.
         """
-        from vllm import LLM, SamplingParams
+        from vllm import SamplingParams
         
         # SQL generation prompt
         sql_prompt = (
@@ -353,16 +361,8 @@ build_index: bool = True,
             "SQL:\n"
         ).format(question=question, schema_text=schema_text)
         
-        # Create vLLM engine without LoRA support
-        llm = LLM(
-            model=self.base_model,
-            tensor_parallel_size=1,
-            max_model_len=4096,
-            dtype="bfloat16",
-            enforce_eager=False,
-            trust_remote_code=True,
-            disable_log_stats=True,
-        )
+        # Use shared LLM instance
+        llm = self._get_base_model_llm()
         
         sampling_params = SamplingParams(
             max_tokens=max_new_tokens,
@@ -379,11 +379,8 @@ build_index: bool = True,
         else:
             sql = ""
         
-        # Shutdown the vLLM engine
-        if hasattr(llm, "shutdown"):
-            llm.shutdown()
-        elif hasattr(llm, "llm_engine"):
-            llm.llm_engine.shutdown()
+        # vLLM v0.19+ manages engine lifecycle automatically
+        # No manual shutdown needed
         
         return sql
     
@@ -429,9 +426,12 @@ build_index: bool = True,
             self.schema_linker.shutdown()
     
     def shutdown(self):
-        """Shut down the schema linker to free resources."""
+        """Shut down the schema linker and base model to free resources."""
         if hasattr(self, 'schema_linker'):
             self.schema_linker.shutdown()
+        if hasattr(self, 'base_model_llm') and self.base_model_llm is not None:
+            # vLLM v0.19+ manages lifecycle automatically
+            self.base_model_llm = None
     
     def __del__(self):
         """Ensure resources are freed on deletion."""
