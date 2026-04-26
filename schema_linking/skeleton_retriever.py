@@ -47,9 +47,9 @@ except ImportError:
     FAISS_AVAILABLE = False
     print("Warning: FAISS not installed. Install with: pip install faiss-cpu")
 
-from .question_skeleton_extractor import QuestionSkeletonExtractor
-from .sql_skeleton_extractor import SQLSkeletonExtractor
-from .skeleton_similarity import SkeletonSimilarity
+from schema_linking.question_skeleton_extractor import QuestionSkeletonExtractor
+from schema_linking.sql_skeleton_extractor import SQLSkeletonExtractor
+from schema_linking.skeleton_similarity import SkeletonSimilarity
 
 
 class SkeletonRetriever:
