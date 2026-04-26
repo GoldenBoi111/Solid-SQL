@@ -186,7 +186,11 @@ def evaluate_questions(
                 round_2_refinement=True
             )
             
-            generated_sql = result["schema_linking_result"]["sql"]
+            # Use the refined SQL if available, otherwise fall back to round 1 SQL
+            if result.get("refined_sql"):
+                generated_sql = result["refined_sql"]
+            else:
+                generated_sql = result.get("round_1_sql", "")
             execution_time = time.time() - start_time
             db_stats[db_id]["total_time"] += execution_time
             
@@ -328,12 +332,13 @@ def main():
     with open(args.questions, "r", encoding="utf-8") as f:
         questions_data = json.load(f)
     
-    # Initialize SolidSQL
+    # Initialize SolidSQL with skeleton extraction skipped
     print("Initializing SolidSQL system...")
     solidsql = SolidSQL(
         candidate_examples=[],  # Empty since we'll load from indices
         adapter_path=args.adapter,
-        build_index=False  # Don't build new index
+        build_index=False,  # Don't build new index
+        skip_skeleton_extraction=True  # Skip question skeleton extraction for evaluation
     )
     
     # Load pre-built FAISS indices

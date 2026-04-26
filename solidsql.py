@@ -52,7 +52,8 @@ class SolidSQL:
         adapter_path: str = "./schema_linking_output/lora_adapter",
         embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
         sql_dialect: str = "sqlite",
-        build_index: bool = True,
+build_index: bool = True,
+        skip_skeleton_extraction: bool = False,
     ):
         """
         Initialize the complete SolidSQL system.
@@ -64,6 +65,7 @@ class SolidSQL:
             embedding_model: Sentence transformer for question embeddings
             sql_dialect: SQL dialect for parsing
             build_index: Whether to build skeleton index immediately
+            skip_skeleton_extraction: Whether to skip question skeleton extraction (for evaluation with pre-built indices)
         """
         # Initialize core components
         self.schema_linker = SchemaLinker(
@@ -72,7 +74,12 @@ class SolidSQL:
         )
 
         # Initialize skeleton components
-        self.q_extractor = QuestionSkeletonExtractor()
+        self.skip_skeleton_extraction = skip_skeleton_extraction
+        if not skip_skeleton_extraction:
+            self.q_extractor = QuestionSkeletonExtractor()
+        else:
+            self.q_extractor = None
+            
         self.sql_extractor = SQLSkeletonExtractor(dialect=sql_dialect)
         self.similarity = SkeletonSimilarity(embedding_model=embedding_model)
 
@@ -114,15 +121,29 @@ class SolidSQL:
         Returns:
             Dictionary with full generation results including intermediate steps
         """
-        # Step 1: Schema linking - predict relevant tables and columns
+        # Step 1: Round 1 - Generate SQL using schema linking LLM (with LoRA)
+        # This uses the same LLM but with a different prompt that generates SQL directly
+        self.schema_linker.set_keep_alive(True)
         schema_result = self.schema_linker.predict(
             question=question,
             schema_text=schema_text,
             max_new_tokens=max_new_tokens,
         )
+        
+        # Generate SQL in round 1 using the base model without LoRA adapter
+        round_1_sql = self._generate_sql_with_base_model(
+            question=question,
+            schema_text=schema_text,
+            max_new_tokens=max_new_tokens,
+        )
 
-        # Step 2: Extract question skeleton for retrieval
-        question_skeleton = self.q_extractor.extract(question)
+        # Step 2: Extract question skeleton for retrieval (if not skipped)
+        question_skeleton = None
+        if not self.skip_skeleton_extraction and self.q_extractor is not None:
+            question_skeleton = self.q_extractor.extract(question)
+        elif self.skip_skeleton_extraction and hasattr(self.schema_linker, '_llm') and self.schema_linker._llm is not None:
+            # Use the SchemaLinker's LLM for question skeleton extraction
+            question_skeleton = self._extract_skeleton_with_shared_llm(question)
 
         # Step 3: Retrieve similar examples
         if self.retriever.question_skeletons:  # Only if index built
@@ -134,23 +155,69 @@ class SolidSQL:
         else:
             retrieval_results = []
 
-        # Step 4: Round-2 refinement (if enabled)
+        # Step 4: Round 2 - Use round 1 SQL for retrieval, then refine with retrieved examples
         refined_sql = None
-        refined_result = None
 
         if round_2_refinement and retrieval_results:
-            # Get the most similar example
-            if retrieval_results:
-                best_example = retrieval_results[0]["example"]
-                # Use the example's SQL as basis for round-2 refinement
-                # This would normally use the full pipeline from the paper
-                # For simplicity, we'll return the example SQL as a demonstration
-                refined_sql = best_example["sql"]
-
-                # In a full implementation, this would involve:
-                # 1. Generate SQL using the example as context
-                # 2. Apply SQL skeleton refinement
-                # 3. Return improved SQL
+            # Get the most similar examples
+            examples_context = []
+            for result in retrieval_results[:3]:  # Use top 3 examples
+                example = result["example"]
+                examples_context.append(f"Question: {example['question']}\nSQL: {example['sql']}")
+            
+            examples_text = "\n\n".join(examples_context)
+            
+            # Create prompt for round 2 SQL generation
+            # This uses the base model WITHOUT LoRA adapter
+            round_2_prompt = (
+                "Given a natural language question, database schema, examples of similar questions with their SQL queries, "
+                "and a preliminary SQL query, generate a refined SQL query to answer the question.\n\n"
+                f"Examples:\n{examples_text}\n\n"
+                f"Question: {question}\n\n"
+                f"Database Schema:\n{schema_text}\n\n"
+                f"Preliminary SQL:\n{round_1_sql}\n\n"
+                "Generate the refined SQL query:\n"
+            )
+            
+            # Generate SQL using the base model without LoRA adapter
+            try:
+                from vllm import LLM, SamplingParams
+                
+                # Create LLM without LoRA adapter for SQL generation
+                sql_generator = LLM(
+                    model=self.base_model,
+                    tensor_parallel_size=1,
+                    max_model_len=4096,
+                    dtype="bfloat16",
+                    enforce_eager=True,
+                    trust_remote_code=True,
+                    disable_log_stats=True,
+                )
+                
+                sampling_params = SamplingParams(
+                    max_tokens=512,
+                    temperature=0.1,
+                    top_p=0.95,
+                )
+                
+                # Generate SQL without LoRA adapter
+                outputs = sql_generator.generate([round_2_prompt], sampling_params)
+                
+                if outputs:
+                    refined_sql = outputs[0].outputs[0].text.strip()
+                    # Clean up the SQL output
+                    refined_sql = self._clean_sql_output(refined_sql)
+                
+                # Shutdown the SQL generator to free resources
+                if hasattr(sql_generator, "shutdown"):
+                    sql_generator.shutdown()
+                elif hasattr(sql_generator, "llm_engine"):
+                    sql_generator.llm_engine.shutdown()
+                    
+            except Exception as e:
+                print(f"Warning: Failed to generate refined SQL: {e}")
+                # Fallback to round 1 SQL if round 2 fails
+                refined_sql = round_1_sql
 
         # Step 5: Return complete results
         result = {
@@ -159,10 +226,12 @@ class SolidSQL:
             "schema_linking_result": schema_result,
             "question_skeleton": question_skeleton,
             "retrieval_results": retrieval_results,
+            "round_1_sql": round_1_sql,
             "refined_sql": refined_sql,
             "full_generation": {
                 "schema_linking": schema_result,
                 "retrieval": retrieval_results,
+                "round_1": round_1_sql,
                 "refinement": refined_sql,
             },
         }
@@ -247,21 +316,121 @@ class SolidSQL:
         """
         self.retriever.load_index(path)
 
-    def shutdown(self):
-        """Shutdown all components and free resources."""
-        try:
-            self.schema_linker.shutdown()
-        except:
-            pass
-        try:
-            self.q_extractor.shutdown()
-        except:
-            pass
-        try:
-            self.sql_extractor.shutdown()
-        except:
-            pass
+    ['prompt], sampling_params, lora_request=lora_request)\n        \n        if outputs:\n            skeleton = outputs[0].outputs[0].text.strip()\n            # Clean up the response (same as QuestionSkeletonExtractor)\n            skeleton = self._clean_skeleton_response(skeleton)\n            return skeleton\n        return "', 'def _format_skeleton_prompt(self, question: str) -> str:\n        "', 'Format prompt for question skeleton extraction."', '\n        from schema_linking.question_skeleton_extractor import SKELETON_EXTRACTION_PROMPT\n        return SKELETON_EXTRACTION_PROMPT.format(question=question)\n        \n    def _clean_skeleton_response(self, response: str) -> str:\n        "', 'Clean up the LLM response (same as QuestionSkeletonExtractor)."', '\n        response = response.strip()\n\n        # Remove quotes if present\n        if response.startswith(\'"\') and response.endswith(\'', '):\n            response = response[1:-1]\n        elif response.startswith("\'") and response.endswith("', '):\n            response = response[1:-1]\n\n        # Remove any trailing explanations after the skeleton\n        # (in case the model didn\'t follow instructions perfectly)\n        if "\n" in response:\n            response = response.split("', [0], '.', 'strip()\n\n        return response']
 
+    def _extract_skeleton_with_shared_llm(self, question: str) -> str:
+        """Extract question skeleton using the SchemaLinker's shared LLM."""
+        # Check if we have a shared LLM from schema linking
+        if hasattr(self.schema_linker, '_llm') and self.schema_linker._llm is not None:
+            return self._extract_skeleton_with_llm(self.schema_linker._llm, question)
+        else:
+            # Fallback to regular extractor if no shared LLM
+            if self.q_extractor is not None:
+                return self.q_extractor.extract(question)
+            return ""
+            
+    def _generate_sql_with_base_model(self, question: str, schema_text: str, max_new_tokens: int = 512) -> str:
+        """
+        Generate SQL using the base model without LoRA adapter.
+        
+        This method creates a custom prompt for SQL generation and uses
+        the base model (without LoRA adapter) for generation.
+        """
+        from vllm import LLM, SamplingParams
+        
+        # SQL generation prompt
+        sql_prompt = (
+            "Given a natural language question and a database schema, "
+            "generate a SQL query to answer the question.\n\n"
+            "Rules:\n"
+            "- Use only tables and columns from the provided schema\n"
+            "- Generate valid SQL that answers the question\n"
+            "- Do NOT include any text outside of the SQL query\n\n"
+            "Question:\n{question}\n\n"
+            "Database Schema:\n{schema_text}\n\n"
+            "SQL:\n"
+        ).format(question=question, schema_text=schema_text)
+        
+        # Create vLLM engine without LoRA support
+        llm = LLM(
+            model=self.base_model,
+            tensor_parallel_size=1,
+            max_model_len=4096,
+            dtype="bfloat16",
+            enforce_eager=True,
+            trust_remote_code=True,
+            disable_log_stats=True,
+        )
+        
+        sampling_params = SamplingParams(
+            max_tokens=max_new_tokens,
+            temperature=0.1,
+            top_p=0.95,
+        )
+        
+        # Generate SQL without LoRA adapter
+        outputs = llm.generate([sql_prompt], sampling_params)
+        
+        if outputs:
+            sql = outputs[0].outputs[0].text.strip()
+            sql = self._clean_sql_output(sql)
+        else:
+            sql = ""
+        
+        # Shutdown the vLLM engine
+        if hasattr(llm, "shutdown"):
+            llm.shutdown()
+        elif hasattr(llm, "llm_engine"):
+            llm.llm_engine.shutdown()
+        
+        return sql
+    
+    def _clean_sql_output(self, sql: str) -> str:
+        """Clean up the SQL output from the LLM."""
+        # Remove any markdown code block markers
+        if sql.startswith("```sql"):
+            sql = sql[6:]
+        elif sql.startswith("```"):
+            sql = sql[3:]
+        if sql.endswith("```"):
+            sql = sql[:-3]
+            
+        # Remove any explanatory text before/after the SQL
+        lines = sql.strip().split('\n')
+        cleaned_lines = []
+        for line in lines:
+            line = line.strip()
+            # Skip lines that look like explanations
+            if not line.startswith("#") and not line.startswith("--") or "SELECT" in line.upper() or "WITH" in line.upper():
+                cleaned_lines.append(line)
+                
+        # Join lines and take only the first SQL statement if there are multiple
+        cleaned_sql = ' '.join(cleaned_lines)
+        # Find the start of the SQL statement
+        select_idx = cleaned_sql.upper().find("SELECT")
+        with_idx = cleaned_sql.upper().find("WITH")
+        
+        if select_idx != -1 and (with_idx == -1 or select_idx < with_idx):
+            cleaned_sql = cleaned_sql[select_idx:]
+        elif with_idx != -1:
+            cleaned_sql = cleaned_sql[with_idx:]
+            
+        # Take only the first statement (up to semicolon)
+        if ";" in cleaned_sql:
+            cleaned_sql = cleaned_sql.split(";")[0] + ";"
+            
+        return cleaned_sql.strip()
+            
+    def shutdown(self):
+        """Shut down the schema linker to free resources."""
+        if hasattr(self, 'schema_linker'):
+            self.schema_linker.shutdown()
+    
+    def shutdown(self):
+        """Shut down the schema linker to free resources."""
+        if hasattr(self, 'schema_linker'):
+            self.schema_linker.shutdown()
+    
     def __del__(self):
         """Ensure resources are freed on deletion."""
         try:
@@ -276,6 +445,7 @@ def create_solidsql_system(
     base_model: str = "openai/gpt-oss-20b",
     adapter_path: str = "./schema_linking_output/lora_adapter",
     build_index: bool = True,
+    skip_skeleton_extraction: bool = False,
 ) -> SolidSQL:
     """
     Create a SolidSQL system with the specified configuration.
@@ -285,6 +455,7 @@ def create_solidsql_system(
         base_model: Hugging Face model name for schema linking
         adapter_path: Path to trained LoRA adapter
         build_index: Whether to build skeleton index immediately
+        skip_skeleton_extraction: Whether to skip question skeleton extraction (for evaluation with pre-built indices)
 
     Returns:
         Initialized SolidSQL system
@@ -294,6 +465,7 @@ def create_solidsql_system(
         base_model=base_model,
         adapter_path=adapter_path,
         build_index=build_index,
+        skip_skeleton_extraction=skip_skeleton_extraction,
     )
 
 
