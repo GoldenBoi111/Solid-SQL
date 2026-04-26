@@ -52,7 +52,7 @@ class SolidSQL:
         adapter_path: str = "./schema_linking_output/lora_adapter",
         embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
         sql_dialect: str = "sqlite",
-build_index: bool = True,
+        build_index: bool = True,
         skip_skeleton_extraction: bool = False,
     ):
         """
@@ -67,12 +67,12 @@ build_index: bool = True,
             build_index: Whether to build skeleton index immediately
             skip_skeleton_extraction: Whether to skip question skeleton extraction (for evaluation with pre-built indices)
         """
-        # Initialize core components
-        self.schema_linker = SchemaLinker(
-            base_model=base_model,
-            adapter_path=adapter_path,
-        )
-
+        # Store configuration
+        self.base_model = base_model
+        self.adapter_path = adapter_path
+        self.embedding_model = embedding_model
+        self.sql_dialect = sql_dialect
+        
         # Initialize skeleton components
         self.skip_skeleton_extraction = skip_skeleton_extraction
         if not skip_skeleton_extraction:
@@ -93,12 +93,56 @@ build_index: bool = True,
         # Build index if provided
         if candidate_examples and build_index:
             self.retriever.build_index(show_progress=False)
+            
+        # Initialize SchemaLinker without LLM (will be set later)
+        self.schema_linker = SchemaLinker(
+            base_model=base_model,
+            adapter_path=adapter_path,
+            llm_instance=None,  # Will be set when needed
+        )
+        
+        # Shared LLM instance (loaded once, reused for all tasks)
+        self._llm_instance = None
+        self._lora_request = None
+        self._initialized = False
 
-        # Store configuration
-        self.base_model = base_model
-        self.adapter_path = adapter_path
-        self.embedding_model = embedding_model
-        self.sql_dialect = sql_dialect
+    def _init_llm(self):
+        """Initialize the shared LLM instance (called once, reused for all tasks)."""
+        if self._initialized:
+            return
+            
+        from vllm import LLM, SamplingParams
+        from vllm.lora.request import LoRARequest
+        
+        print("\n" + "="*60)
+        print("Initializing shared LLM engine (loaded once)")
+        print("="*60)
+        
+        self._llm_instance = LLM(
+            model=self.base_model,
+            tensor_parallel_size=1,
+            max_model_len=2048,
+            dtype="bfloat16",
+            enable_lora=True,
+            max_loras=4,
+            max_lora_rank=64,
+            enforce_eager=True,
+            trust_remote_code=True,
+            disable_log_stats=True,
+            gpu_memory_utilization=0.85,
+            max_num_batched_tokens=16384,
+            max_num_seqs=256,
+        )
+        
+        self._lora_request = LoRARequest("schema_linking", 1, self.adapter_path)
+        self._initialized = True
+        
+        # Update schema linker with the shared LLM
+        self.schema_linker._llm = self._llm_instance
+        self.schema_linker._lora_request = self._lora_request
+        
+        print(f"LLM initialized successfully")
+        print("="*60 + "\n")
 
     def generate_sql(
         self,
@@ -121,6 +165,9 @@ build_index: bool = True,
         Returns:
             Dictionary with full generation results including intermediate steps
         """
+        # Initialize LLM on first use
+        self._init_llm()
+        
         # Step 1: Schema linking with LoRA adapter
         schema_result = self.schema_linker.predict(
             question=question,
@@ -292,9 +339,7 @@ build_index: bool = True,
             sql_index_path: Optional path to SQL FAISS index
         """
         self.retriever.load_index(path, question_index_path=question_index_path, sql_index_path=sql_index_path)
-
-    ['prompt], sampling_params, lora_request=lora_request)\n        \n        if outputs:\n            skeleton = outputs[0].outputs[0].text.strip()\n            # Clean up the response (same as QuestionSkeletonExtractor)\n            skeleton = self._clean_skeleton_response(skeleton)\n            return skeleton\n        return "', 'def _format_skeleton_prompt(self, question: str) -> str:\n        "', 'Format prompt for question skeleton extraction."', '\n        from schema_linking.question_skeleton_extractor import SKELETON_EXTRACTION_PROMPT\n        return SKELETON_EXTRACTION_PROMPT.format(question=question)\n        \n    def _clean_skeleton_response(self, response: str) -> str:\n        "', 'Clean up the LLM response (same as QuestionSkeletonExtractor)."', '\n        response = response.strip()\n\n        # Remove quotes if present\n        if response.startswith(\'"\') and response.endswith(\'', '):\n            response = response[1:-1]\n        elif response.startswith("\'") and response.endswith("', '):\n            response = response[1:-1]\n\n        # Remove any trailing explanations after the skeleton\n        # (in case the model didn\'t follow instructions perfectly)\n        if "\n" in response:\n            response = response.split("', [0], '.', 'strip()\n\n        return response']
-
+            
     def _extract_skeleton_with_shared_llm(self, question: str) -> str:
         """Extract question skeleton using the SchemaLinker's shared LLM."""
         from schema_linking.question_skeleton_extractor import SKELETON_EXTRACTION_PROMPT
@@ -416,6 +461,13 @@ build_index: bool = True,
         """Shut down the schema linker to free resources."""
         if hasattr(self, 'schema_linker'):
             self.schema_linker.shutdown()
+        # Also shutdown the shared LLM if we own it
+        if hasattr(self, '_llm_instance') and self._llm_instance is not None:
+            try:
+                self._llm_instance.shutdown()
+            except:
+                pass
+            self._llm_instance = None
     
     def __del__(self):
         """Ensure resources are freed on deletion."""

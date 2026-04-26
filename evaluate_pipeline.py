@@ -359,6 +359,10 @@ def main():
     print_summary(stats)
     
     print(f"\nDetailed results saved to: {args.output}")
+    
+    # Clean up resources
+    print("Cleaning up resources...")
+    solidsql.shutdown()
 
 
 if __name__ == "__main__":

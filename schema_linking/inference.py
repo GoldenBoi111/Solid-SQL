@@ -10,9 +10,11 @@ so the base model stays clean for other tasks.
 Usage:
     from schema_linking.inference import SchemaLinker
 
+    # With shared LLM instance
     linker = SchemaLinker(
         base_model="openai/gpt-oss-20b",
         adapter_path="./schema_linking_output/lora_adapter",
+        llm_instance=shared_llm,  # Pass pre-created LLM
     )
 
     # Single prediction
@@ -20,12 +22,6 @@ Usage:
         question="How many singers are older than 20?",
         schema_text="Singer(id, name, age)\nAlbum(id, singer_id, title)",
     )
-
-    # Batch prediction
-    results = linker.predict_batch([
-        {"question": "...", "schema_text": "..."},
-        {"question": "...", "schema_text": "..."},
-    ])
 """
 
 import json
@@ -49,6 +45,7 @@ class SchemaLinker:
         adapter_path: str = "",
         tensor_parallel_size: int = 1,
         max_seq_length: int = MAX_SEQ_LENGTH,
+        llm_instance: object = None,
     ):
         """
         Initialize the schema linker.
@@ -58,6 +55,7 @@ class SchemaLinker:
             adapter_path: Path to the fine-tuned LoRA adapter directory
             tensor_parallel_size: Number of GPUs for tensor parallelism
             max_seq_length: Maximum sequence length (prompt + output)
+            llm_instance: Optional pre-created LLM instance to reuse (for shared model loading)
         """
         if not adapter_path:
             adapter_path = str(Path(OUTPUT_DIR) / "lora_adapter")
@@ -72,12 +70,14 @@ class SchemaLinker:
         self.base_model_name = base_model
         self.max_seq_length = max_seq_length
         self.tensor_parallel_size = tensor_parallel_size
-        self._llm = None
+        self._llm = llm_instance  # Use provided instance or create new one
         self._lora_request = None
+        self._own_llm = llm_instance is None  # Track if we own the LLM instance
 
         # Import vLLM here to defer the dependency until use time
         try:
             from vllm import LLM, SamplingParams
+            from vllm.lora.request import LoRARequest
         except ImportError:
             raise ImportError(
                 "vLLM is required for schema linking inference. "
@@ -86,6 +86,10 @@ class SchemaLinker:
 
         self.LLM = LLM
         self.SamplingParams = SamplingParams
+        self.LoRARequest = LoRARequest
+
+        # Create LoRA request for schema linking
+        self._lora_request = self.LoRARequest("schema_linking", 1, str(self.adapter_path))
 
         print(f"\n{'='*60}")
         print(f"Schema Linker Initialization (vLLM)")
@@ -94,6 +98,7 @@ class SchemaLinker:
         print(f"  Adapter:    {adapter_path}")
         print(f"  GPUs:       {tensor_parallel_size}")
         print(f"  Max seq len: {max_seq_length}")
+        print(f"  Shared LLM: {llm_instance is not None}")
         print(f"{'='*60}\n")
 
     def _format_prompt(self, question: str, schema_text: str) -> str:
@@ -104,44 +109,34 @@ class SchemaLinker:
         )
 
     def _get_llm(self):
-        """Get or create the vLLM engine instance (created once with LoRA support enabled)."""
-        if self._llm is None:
-            llm = self.LLM(
-                model=self.base_model_name,
-                tensor_parallel_size=self.tensor_parallel_size,
-                max_model_len=self.max_seq_length,
-                dtype="bfloat16",
-                enable_lora=True,  # Always enable LoRA support
-                max_loras=4,
-                max_lora_rank=LORA_R,
-                enforce_eager=False,
-                trust_remote_code=True,
-                disable_log_stats=True,
-            )
-            self._llm = llm
-            # Create LoRA request for schema linking
-            from vllm.lora.request import LoRARequest
-            self._lora_request = LoRARequest("schema_linking", 1, str(self.adapter_path))
+        """Get the vLLM engine instance (should be created externally and shared)."""
         return self._llm
 
-    def _create_sampling_params(self, max_new_tokens: int):
+    def _create_sampling_params(self, max_new_tokens: int, use_lora: bool = True):
         """Create SamplingParams with structured JSON output."""
-        try:
-            # vLLM v0.11+
-            from vllm.sampling_params import StructuredOutputsParams
+        if use_lora:
+            try:
+                # vLLM v0.11+
+                from vllm.sampling_params import StructuredOutputsParams
+                return self.SamplingParams(
+                    max_tokens=max_new_tokens,
+                    temperature=0.1,
+                    top_p=0.95,
+                    structured_outputs=StructuredOutputsParams(json=OUTPUT_SCHEMA),
+                )
+            except ImportError:
+                # vLLM < v0.11
+                return self.SamplingParams(
+                    max_tokens=max_new_tokens,
+                    temperature=0.1,
+                    top_p=0.95,
+                    guided_json=json.dumps(OUTPUT_SCHEMA),
+                )
+        else:
             return self.SamplingParams(
                 max_tokens=max_new_tokens,
                 temperature=0.1,
                 top_p=0.95,
-                structured_outputs=StructuredOutputsParams(json=OUTPUT_SCHEMA),
-            )
-        except ImportError:
-            # vLLM < v0.11
-            return self.SamplingParams(
-                max_tokens=max_new_tokens,
-                temperature=0.1,
-                top_p=0.95,
-                guided_json=json.dumps(OUTPUT_SCHEMA),
             )
 
     def predict(
@@ -153,8 +148,7 @@ class SchemaLinker:
         """
         Generate schema linking prediction for a single question.
 
-        Loads the LoRA adapter, generates with forced JSON schema,
-        then unloads the adapter.
+        Uses the shared LLM with LoRA adapter loaded.
         """
         results = self.predict_batch(
             [{"question": question, "schema_text": schema_text}],
@@ -174,9 +168,12 @@ class SchemaLinker:
 
         Reuses the same LLM instance with LoRA adapter loaded.
         """
-        # Get the shared LLM instance (created with LoRA support, we'll use lora_request=self._lora_request)
+        # Get the shared LLM instance
         llm = self._get_llm()
-        sampling_params = self._create_sampling_params(max_new_tokens)
+        if llm is None:
+            raise RuntimeError("No LLM instance available. Initialize SolidSQL first.")
+            
+        sampling_params = self._create_sampling_params(max_new_tokens, use_lora=True)
 
         # Format all prompts
         prompts = [
@@ -224,13 +221,12 @@ class SchemaLinker:
         Returns:
             List of generated text strings
         """
-        # Get the shared LLM instance (created with LoRA support, but we'll use lora_request=None)
+        # Get the shared LLM instance
         llm = self._get_llm()
-        sampling_params = self.SamplingParams(
-            max_tokens=max_new_tokens,
-            temperature=0.1,
-            top_p=0.95,
-        )
+        if llm is None:
+            raise RuntimeError("No LLM instance available. Initialize SolidSQL first.")
+            
+        sampling_params = self._create_sampling_params(max_new_tokens, use_lora=False)
 
         # Generate in sub-batches for memory efficiency
         all_outputs = []
@@ -254,8 +250,8 @@ class SchemaLinker:
         self._keep_alive = keep_alive
 
     def shutdown(self):
-        """Shut down the LLM engine to free resources."""
-        if hasattr(self, '_llm') and self._llm is not None:
+        """Shut down the LLM engine to free resources (only if we own it)."""
+        if hasattr(self, '_own_llm') and self._own_llm and hasattr(self, '_llm') and self._llm is not None:
             try:
                 self._llm.shutdown()
             except:
