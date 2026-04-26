@@ -17,10 +17,11 @@ The system consists of several key components:
    - Skeleton similarity calculations
    - Example retrieval system
 
-3. **Full Retrieval System**
+3. **Full Retrieval System with FAISS**
    - Complete skeleton-based example retrieval pipeline
    - Round-2 SQL refinement
    - Candidate example management
+   - FAISS indexes for efficient similarity search
 
 4. **Training Infrastructure**
    - Dataset building pipeline
@@ -43,7 +44,7 @@ The system consists of several key components:
 - `schema_linking/question_skeleton_extractor.py`
 - `schema_linking/sql_skeleton_extractor.py`
 - `schema_linking/skeleton_similarity.py`
-- `schema_linking/skeleton_retriever.py`
+- `schema_linking/skeleton_retriever.py` (with FAISS indexing)
 
 ### Full End-to-End System
 - `solidsql.py`: Complete SolidSQL system combining all components
@@ -62,10 +63,12 @@ The complete SolidSQL system now includes:
 - Extracts structural skeletons S⋆ from SQL statements
 - Supports edit distance similarity calculation
 
-### Skeleton-Based Example Retrieval
+### Skeleton-Based Example Retrieval with FAISS
 - Retrieves top-N most similar examples based on question structure
 - Supports both question-based and SQL-based retrieval modes
-- Uses cosine similarity for question skeletons and edit distance for SQL skeletons
+- Uses FAISS for efficient vector similarity search
+- Supports multiple index types: flat, ivf, hnsw
+- FAISS indexes can be saved and loaded for reuse
 
 ### Round-2 Refinement Pipeline
 - Uses retrieved examples to improve SQL generation quality
@@ -102,6 +105,28 @@ result = solidsql.generate_sql(
 )
 ```
 
+### Using FAISS Indexes:
+```python
+from schema_linking.skeleton_retriever import SkeletonRetriever
+
+# Create retriever with FAISS index
+retriever = SkeletonRetriever(
+    candidate_examples=examples,
+    faiss_index_type="hnsw"  # Options: "flat", "ivf", "hnsw"
+)
+
+# Build FAISS index
+retriever.build_index()
+
+# Retrieve similar examples
+results = retriever.retrieve_by_question(question="...", top_n=5)
+
+# Save and load index
+retriever.save_index("index.json")
+new_retriever = SkeletonRetriever([])
+new_retriever.load_index("index.json")
+```
+
 ## Training Pipeline
 
 The training pipeline is structured as follows:
@@ -129,6 +154,12 @@ The training pipeline is structured as follows:
 - torch
 - numpy
 - sentence-transformers
+- faiss-cpu (for efficient similarity search)
+
+Install all requirements:
+```bash
+pip install -r schema_linking/requirements.txt
+```
 
 ## Next Steps for Minidev
 
@@ -146,8 +177,20 @@ The current implementation provides the complete end-to-end SolidSQL system as s
 1. ✅ Core schema linking with GPT-OSS-20B model
 2. ✅ Question skeleton extraction (Section 3.4.1)
 3. ✅ SQL skeleton extraction (Section 3.4.2) 
-4. ✅ Skeleton-based example retrieval
+4. ✅ Skeleton-based example retrieval with FAISS
 5. ✅ Round-2 refinement pipeline
 6. ✅ Complete end-to-end workflow
 
 The system is ready for minidev results with full retrieval capabilities and round-2 refinement as described in the research paper.
+
+## FAISS Index Types
+
+The retriever supports three FAISS index types:
+
+- **flat**: Exact nearest neighbor search (slowest, most accurate)
+- **ivf**: Inverted file index with clustering (faster, approximate)
+- **hnsw**: Hierarchical Navigable Small World (fastest, approximate)
+
+Choose the index type based on your needs:
+- Use `flat` for small datasets (< 1000 examples)
+- Use `ivf` or `hnsw` for larger datasets

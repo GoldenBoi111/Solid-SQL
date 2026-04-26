@@ -8,3 +8,4 @@ tensorboard
 datasets
 sentence-transformers>=2.2.0
 numpy>=1.24.0
+faiss-cpu>=1.7.0

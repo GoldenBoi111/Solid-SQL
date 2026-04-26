@@ -165,3 +165,57 @@ class SkeletonSimilarity:
             sim = self.sql_similarity(query_skeleton, cand_skeleton)
             similarities.append(sim)
         return similarities
+
+    def get_question_embeddings(
+        self,
+        skeletons: List[str],
+        batch_size: int = 32,
+    ) -> List[List[float]]:
+        """
+        Get embeddings for a list of question skeletons.
+
+        Args:
+            skeletons: List of question skeletons to embed
+            batch_size: Batch size for encoding
+
+        Returns:
+            List of embedding vectors
+        """
+        self._load_embedding_model()
+
+        embeddings = self._embedding_model.encode(
+            skeletons,
+            batch_size=batch_size,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+        )
+
+        return embeddings.tolist()
+
+    def get_sql_embeddings(
+        self,
+        skeletons: List[str],
+        batch_size: int = 32,
+    ) -> List[List[float]]:
+        """
+        Get embeddings for a list of SQL skeletons using the same model as questions.
+
+        This allows FAISS to work with both question and SQL skeletons.
+
+        Args:
+            skeletons: List of SQL skeletons to embed
+            batch_size: Batch size for encoding
+
+        Returns:
+            List of embedding vectors
+        """
+        self._load_embedding_model()
+
+        embeddings = self._embedding_model.encode(
+            skeletons,
+            batch_size=batch_size,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+        )
+
+        return embeddings.tolist()
