@@ -74,7 +74,6 @@ class SchemaLinker:
         self._model = None
         self._tokenizer = None
         self._lora_loaded = False  # True once PeftModel wrapper exists (never resets)
-        self._lora_active = False   # True when adapter is currently applied  # True once PeftModel wrapper exists (never resets)
         self._lora_active = False   # True when adapter is currently applied
 
         print(f"\n{'='*60}")
@@ -98,40 +97,36 @@ class SchemaLinker:
             if self._tokenizer.pad_token is None:
                 self._tokenizer.pad_token = self._tokenizer.eos_token
 
+            # Load model WITHOUT device_map to avoid hf_quantizer error
             self._model = AutoModelForCausalLM.from_pretrained(
                 self.base_model_name,
                 trust_remote_code=True,
                 torch_dtype=torch.bfloat16,
-                device_map="auto",
             )
+
+            # If adapter exists, wrap with PeftModel BEFORE moving to GPU
+            if self.has_adapter and not self._lora_loaded:
+                from peft import PeftModel
+                print("Loading LoRA adapter (first time)...")
+                self._model = PeftModel.from_pretrained(
+                    self._model,
+                    str(self.adapter_path),
+                    adapter_name="lora_adapter",
+                )
+                self._lora_loaded = True
+
+            # Move to GPU and set to eval mode
+            self._model = self._model.to("cuda")
             self._model.eval()
             print("Base model loaded.")
 
     def _load_lora(self):
-        """Load the LoRA adapter into the model (only once)."""
+        """Activate the LoRA adapter (already loaded in _load_model)."""
         if not self.has_adapter:
             return
         
-        from peft import PeftModel
-        
-        # Check if model is already a PeftModel (adapter already loaded)
-        if isinstance(self._model, PeftModel):
-            self._lora_loaded = True
-        else:
-            print("Loading LoRA adapter (first time)...")
-            
-            # Patch missing attribute caused by device_map="auto" + PEFT version mismatch
-            if not hasattr(self._model, 'hf_quantizer'):
-                self._model.hf_quantizer = None
-            
-            self._model = PeftModel.from_pretrained(
-                self._model,
-                str(self.adapter_path),
-                adapter_name="lora_adapter",
-            )
-            self._lora_loaded = True
-            print("LoRA adapter loaded.")
-        
+        # Adapter is already wrapped in PeftModel during _load_model,
+        # just activate it
         self._model.enable_adapters()
         self._model.set_adapter("lora_adapter")
         self._lora_active = True
