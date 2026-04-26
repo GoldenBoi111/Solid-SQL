@@ -31,7 +31,7 @@ from typing import List, Dict, Optional
 import outlines
 import torch
 from pydantic import BaseModel
-from outlines.models import transformers as outlines_transformers
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import (
     MODEL_NAME,
@@ -83,8 +83,6 @@ class SchemaLinker:
         self.max_seq_length = max_seq_length
         self._model = None
         self._tokenizer = None
-        self._schema_linking_generator = None
-        self._sql_generator = None
         self._lora_loaded = False  # True once the adapter has been loaded (never resets)
         self._lora_active = False   # True when adapter is currently applied
 
@@ -100,34 +98,31 @@ class SchemaLinker:
         """Load the base model and tokenizer."""
         if self._model is None:
             print("Loading base model...")
-            self._model = outlines_transformers(
+            hf_model = AutoModelForCausalLM.from_pretrained(
                 self.base_model_name,
-                device="cuda",
-                model_kwargs={"dtype": torch.bfloat16, "device_map": "auto"},
+                trust_remote_code=True,
+                dtype=torch.bfloat16,
+                device_map="auto",
             )
-            self._tokenizer = self._model.tokenizer
+            hf_tokenizer = AutoTokenizer.from_pretrained(
+                self.base_model_name,
+                trust_remote_code=True,
+            )
+            if hf_tokenizer.pad_token is None:
+                hf_tokenizer.pad_token = hf_tokenizer.eos_token
 
-            # Outlines wraps the underlying nn.Module; attach adapters there.
             if self.has_adapter and not self._lora_loaded:
                 print("Loading LoRA adapter (first time)...")
-                self._model.model.load_adapter(
+                hf_model.load_adapter(
                     str(self.adapter_path),
                     adapter_name="lora_adapter",
                 )
                 self._lora_loaded = True
                 self._lora_active = True
 
+            self._model = outlines.from_transformers(hf_model, hf_tokenizer)
+            self._tokenizer = hf_tokenizer
             self._model.model.eval()
-            if self._schema_linking_generator is None:
-                self._schema_linking_generator = outlines.generate.json(
-                    self._model,
-                    SchemaLinkingOutput,
-                )
-            if self._sql_generator is None:
-                self._sql_generator = outlines.generate.json(
-                    self._model,
-                    SQLOutput,
-                )
             print("Base model loaded.")
 
     def _load_lora(self):
@@ -203,9 +198,10 @@ class SchemaLinker:
         for i in range(0, total, batch_size):
             batch_prompts = prompts[i : i + batch_size]
             for prompt in batch_prompts:
-                output = self._schema_linking_generator(
+                output = self._model(
                     prompt,
-                    max_tokens=max_new_tokens,
+                    output_type=SchemaLinkingOutput,
+                    max_new_tokens=max_new_tokens,
                 )
                 all_results.append(self._output_to_dict(output))
 
@@ -250,9 +246,10 @@ class SchemaLinker:
         for i in range(0, total, batch_size):
             batch_prompts = prompts[i : i + batch_size]
             for prompt in batch_prompts:
-                output = self._sql_generator(
+                output = self._model(
                     prompt,
-                    max_tokens=max_new_tokens,
+                    output_type=SQLOutput,
+                    max_new_tokens=max_new_tokens,
                 )
                 all_outputs.append(output.sql)
 
@@ -272,8 +269,6 @@ class SchemaLinker:
         if self._tokenizer is not None:
             del self._tokenizer
             self._tokenizer = None
-        self._schema_linking_generator = None
-        self._sql_generator = None
         self._lora_loaded = False
         self._lora_active = False
 
