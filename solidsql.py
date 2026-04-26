@@ -81,7 +81,8 @@ class SolidSQL:
             base_model=base_model,
             adapter_path=adapter_path,
         )
-        
+        self.schema_linker._load_model()  # eager load so shared_model is not None
+
         # Initialize question extractor with shared model
         if not skip_skeleton_extraction:
             self.q_extractor = QuestionSkeletonExtractor(
@@ -388,6 +389,9 @@ class SolidSQL:
     
     def _clean_sql_output(self, sql: str) -> str:
         """Clean up the SQL output from the LLM."""
+        if sql.upper().startswith('SQL:'):
+            sql = sql[4:].strip()
+
         # Remove any markdown code block markers
         if sql.startswith("```sql"):
             sql = sql[6:]
