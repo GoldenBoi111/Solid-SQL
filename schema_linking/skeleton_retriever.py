@@ -41,6 +41,7 @@ from typing import List, Dict, Optional, Tuple, Any
 
 try:
     import faiss
+
     FAISS_AVAILABLE = True
 except ImportError:
     FAISS_AVAILABLE = False
@@ -54,9 +55,9 @@ from .skeleton_similarity import SkeletonSimilarity
 class SkeletonRetriever:
     """
     Retrieves similar examples from a candidate library using skeleton-based similarity.
-    
+
     Uses FAISS for efficient vector similarity search.
-    
+
     Supports two retrieval modes:
     1. Question skeleton-based: Matches question structure (Q⋆)
     2. SQL skeleton-based: Matches SQL structure (S⋆)
@@ -71,7 +72,7 @@ class SkeletonRetriever:
     ):
         """
         Initialize the retriever.
-        
+
         Args:
             candidate_examples: List of dicts with "question" and "sql" keys
             embedding_model: Sentence transformer model for question embeddings
@@ -84,16 +85,16 @@ class SkeletonRetriever:
         self.question_embeddings = None
         self.sql_skeletons_list = []
         self.sql_embeddings = None
-        
+
         # FAISS indexes
         self.question_index = None
         self.sql_index = None
-        
+
         # Initialize extractors and similarity calculator
         self.q_extractor = QuestionSkeletonExtractor()
         self.sql_extractor = SQLSkeletonExtractor(dialect=sql_dialect)
         self.similarity = SkeletonSimilarity(embedding_model=embedding_model)
-        
+
         self.faiss_index_type = faiss_index_type
 
     def build_index(
@@ -104,10 +105,10 @@ class SkeletonRetriever:
     ) -> None:
         """
         Pre-compute skeletons for all candidate examples and build FAISS indexes.
-        
+
         This should be called once during initialization to build the
         example index for fast retrieval.
-        
+
         Args:
             batch_size: Batch size for skeleton extraction
             show_progress: Whether to show progress
@@ -138,7 +139,7 @@ class SkeletonRetriever:
 
         if show_progress:
             print(f"Building FAISS indexes...")
-        
+
         # Build FAISS index for question skeletons
         if FAISS_AVAILABLE:
             self._build_faiss_index_for_questions(faiss_dim)
@@ -149,21 +150,23 @@ class SkeletonRetriever:
                 print("  Using in-memory similarity (FAISS not available)")
 
         if show_progress:
-            print(f"Index built with {len(self.question_skeletons)} question skeletons "
-                  f"and {len(self.sql_skeletons)} SQL skeletons")
+            print(
+                f"Index built with {len(self.question_skeletons)} question skeletons "
+                f"and {len(self.sql_skeletons)} SQL skeletons"
+            )
 
     def _build_faiss_index_for_questions(self, dim: int) -> None:
         """Build FAISS index for question skeleton embeddings."""
         if not FAISS_AVAILABLE:
             return
-            
+
         if not self.question_skeletons:
             return
-        
+
         # Extract embeddings for all question skeletons
         embeddings = self.similarity.get_question_embeddings(self.question_skeletons)
         self.question_embeddings = np.array(embeddings, dtype=np.float32)
-        
+
         # Create FAISS index
         if self.faiss_index_type == "hnsw":
             self.question_index = faiss.IndexHNSWFlat(dim, 32)
@@ -175,7 +178,7 @@ class SkeletonRetriever:
             self.question_index.train(self.question_embeddings)
         else:  # flat
             self.question_index = faiss.IndexFlatL2(dim)
-        
+
         # Add embeddings to index
         self.question_index.add(self.question_embeddings)
 
@@ -183,14 +186,14 @@ class SkeletonRetriever:
         """Build FAISS index for SQL skeleton embeddings."""
         if not FAISS_AVAILABLE:
             return
-            
+
         if not self.sql_skeletons_list:
             return
-        
+
         # Extract embeddings for all SQL skeletons
         embeddings = self.similarity.get_sql_embeddings(self.sql_skeletons_list)
         self.sql_embeddings = np.array(embeddings, dtype=np.float32)
-        
+
         # Create FAISS index
         if self.faiss_index_type == "hnsw":
             self.sql_index = faiss.IndexHNSWFlat(dim, 32)
@@ -202,7 +205,7 @@ class SkeletonRetriever:
             self.sql_index.train(self.sql_embeddings)
         else:  # flat
             self.sql_index = faiss.IndexFlatL2(dim)
-        
+
         # Add embeddings to index
         self.sql_index.add(self.sql_embeddings)
 
@@ -214,21 +217,19 @@ class SkeletonRetriever:
     ) -> List[Dict[str, Any]]:
         """
         Retrieve top-N most similar examples based on question skeleton.
-        
+
         Uses FAISS for efficient similarity search.
-        
+
         Args:
             question: The target natural language question
             top_n: Number of examples to retrieve
             show_progress: Whether to show progress
-            
+
         Returns:
             List of dicts with example, similarity score, and skeletons
         """
         if not self.question_skeletons:
-            raise ValueError(
-                "Skeleton index not built. Call build_index() first."
-            )
+            raise ValueError("Skeleton index not built. Call build_index() first.")
 
         # Extract skeleton from target question
         if show_progress:
@@ -249,19 +250,17 @@ class SkeletonRetriever:
         return self._rank_and_return(similarities, top_n, target_skeleton, "question")
 
     def _retrieve_with_faiss_question(
-        self, 
-        target_skeleton: str, 
-        top_n: int
+        self, target_skeleton: str, top_n: int
     ) -> List[float]:
         """Retrieve using FAISS index."""
         # Get embedding for target skeleton
         target_embedding = self.similarity.get_question_embeddings([target_skeleton])[0]
         target_embedding = np.array(target_embedding, dtype=np.float32).reshape(1, -1)
-        
+
         # Search with FAISS
         if self.question_index is not None:
             distances, indices = self.question_index.search(target_embedding, top_n)
-            
+
             # Convert distances to similarities (1 - normalized_distance)
             similarities = 1.0 / (1.0 + distances[0])
             return similarities.tolist()
@@ -280,21 +279,19 @@ class SkeletonRetriever:
     ) -> List[Dict[str, Any]]:
         """
         Retrieve top-N most similar examples based on SQL skeleton.
-        
+
         This is useful for round-2 SQL generation refinement.
-        
+
         Args:
             sql: The generated SQL statement
             top_n: Number of examples to retrieve
             show_progress: Whether to show progress
-            
+
         Returns:
             List of dicts with example, similarity score, and skeletons
         """
         if not self.sql_skeletons:
-            raise ValueError(
-                "Skeleton index not built. Call build_index() first."
-            )
+            raise ValueError("Skeleton index not built. Call build_index() first.")
 
         # Extract skeleton from target SQL
         if show_progress:
@@ -314,20 +311,16 @@ class SkeletonRetriever:
         # Rank and return top-N
         return self._rank_and_return(similarities, top_n, target_skeleton, "sql")
 
-    def _retrieve_with_faiss_sql(
-        self, 
-        target_skeleton: str, 
-        top_n: int
-    ) -> List[float]:
+    def _retrieve_with_faiss_sql(self, target_skeleton: str, top_n: int) -> List[float]:
         """Retrieve using FAISS index."""
         # Get embedding for target skeleton
         target_embedding = self.similarity.get_sql_embeddings([target_skeleton])[0]
         target_embedding = np.array(target_embedding, dtype=np.float32).reshape(1, -1)
-        
+
         # Search with FAISS
         if self.sql_index is not None:
             distances, indices = self.sql_index.search(target_embedding, top_n)
-            
+
             # Convert distances to similarities (1 - normalized_distance)
             similarities = 1.0 / (1.0 + distances[0])
             return similarities.tolist()
@@ -347,13 +340,13 @@ class SkeletonRetriever:
     ) -> List[Dict[str, Any]]:
         """
         Rank examples by similarity and return top-N.
-        
+
         Args:
             similarities: List of similarity scores
             top_n: Number of examples to return
             target_skeleton: The target skeleton (for reference)
             skeleton_type: Either "question" or "sql"
-            
+
         Returns:
             List of ranked examples with metadata
         """
@@ -383,9 +376,9 @@ class SkeletonRetriever:
     def save_index(self, path: str, save_faiss: bool = True) -> None:
         """
         Save the built index to disk for reuse.
-        
+
         Saves FAISS indexes as binary files and metadata as JSON.
-        
+
         Args:
             path: Base path for saving the index
             save_faiss: Whether to save FAISS indexes
@@ -396,16 +389,16 @@ class SkeletonRetriever:
         # Create directory for index files
         index_dir = Path(path).parent
         index_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Save FAISS indexes as binary files
         if save_faiss and FAISS_AVAILABLE:
             question_index_path = Path(path).with_suffix(".question.index")
             sql_index_path = Path(path).with_suffix(".sql.index")
-            
+
             if self.question_index is not None:
                 faiss.write_index(self.question_index, str(question_index_path))
                 print(f"Question FAISS index saved to: {question_index_path}")
-            
+
             if self.sql_index is not None:
                 faiss.write_index(self.sql_index, str(sql_index_path))
                 print(f"SQL FAISS index saved to: {sql_index_path}")
@@ -417,19 +410,19 @@ class SkeletonRetriever:
             "question_skeletons": self.question_skeletons,
             "sql_skeletons": self.sql_skeletons,
         }
-        
+
         with open(metadata_path, "w", encoding="utf-8") as f:
             json.dump(index_data, f, indent=2, ensure_ascii=False)
-        
+
         print(f"Metadata saved to: {metadata_path}")
         print(f"Index base path: {path}")
 
     def load_index(self, path: str, load_faiss: bool = True) -> None:
         """
         Load a previously saved index from disk.
-        
+
         Loads FAISS indexes from binary files and metadata from JSON.
-        
+
         Args:
             path: Base path of the saved index
             load_faiss: Whether to load FAISS indexes
@@ -442,18 +435,18 @@ class SkeletonRetriever:
         self.candidates = index_data["candidates"]
         self.question_skeletons = index_data["question_skeletons"]
         self.sql_skeletons = index_data["sql_skeletons"]
-        
+
         # Load FAISS indexes from binary files if available
         if load_faiss and FAISS_AVAILABLE:
             question_index_path = Path(path).with_suffix(".question.index")
             sql_index_path = Path(path).with_suffix(".sql.index")
-            
+
             if question_index_path.exists():
                 self.question_index = faiss.read_index(str(question_index_path))
                 print(f"Question FAISS index loaded from: {question_index_path}")
             else:
                 self.question_index = None
-            
+
             if sql_index_path.exists():
                 self.sql_index = faiss.read_index(str(sql_index_path))
                 print(f"SQL FAISS index loaded from: {sql_index_path}")
@@ -477,18 +470,18 @@ class SkeletonRetriever:
 def load_candidate_library_from_json(path: str) -> List[Dict[str, str]]:
     """
     Load candidate examples from a JSON file.
-    
+
     Expected format:
     [
         {"question": "...", "sql": "...", ...},
         {"question": "...", "sql": "...", ...},
     ]
-    
+
     Also supports alternative format with "Question" and "SQL" keys.
-    
+
     Args:
         path: Path to JSON file
-        
+
     Returns:
         List of candidate examples
     """
@@ -498,11 +491,12 @@ def load_candidate_library_from_json(path: str) -> List[Dict[str, str]]:
     # Validate and normalize format
     for i, entry in enumerate(data):
         # Convert alternative format to standard format
-        if "Question" in entry and "SQL" in entry:
+        if "Question" in entry:
             entry["question"] = entry.pop("Question")
+        if "SQL" in entry:
             entry["sql"] = entry.pop("SQL")
         # Validate format
-        elif "question" not in entry or "sql" not in entry:
+        if "question" not in entry or "sql" not in entry:
             raise ValueError(
                 f"Entry {i} missing 'question' or 'sql' field. "
                 f"Found keys: {list(entry.keys())}"
@@ -517,11 +511,11 @@ def load_candidate_library_from_spider(
 ) -> List[Dict[str, str]]:
     """
     Load candidate examples from Spider dataset format.
-    
+
     Args:
         train_path: Path to Spider train.json
         max_examples: Maximum number of examples to load (None for all)
-        
+
     Returns:
         List of candidate examples with "question" and "sql" keys
     """
@@ -530,11 +524,13 @@ def load_candidate_library_from_spider(
 
     candidates = []
     for entry in data:
-        candidates.append({
-            "question": entry.get("question", ""),
-            "sql": entry.get("query", ""),
-            "db_id": entry.get("db_id", ""),
-        })
+        candidates.append(
+            {
+                "question": entry.get("question", ""),
+                "sql": entry.get("query", ""),
+                "db_id": entry.get("db_id", ""),
+            }
+        )
         if max_examples and len(candidates) >= max_examples:
             break
 
