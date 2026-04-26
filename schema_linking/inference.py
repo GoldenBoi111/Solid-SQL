@@ -73,7 +73,9 @@ class SchemaLinker:
         self.max_seq_length = max_seq_length
         self._model = None
         self._tokenizer = None
-        self._lora_loaded = False
+        self._lora_loaded = False  # True once PeftModel wrapper exists (never resets)
+        self._lora_active = False   # True when adapter is currently applied  # True once PeftModel wrapper exists (never resets)
+        self._lora_active = False   # True when adapter is currently applied
 
         print(f"\n{'='*60}")
         print(f"Schema Linker Initialization (Transformers)")
@@ -109,45 +111,40 @@ class SchemaLinker:
         """Load the LoRA adapter into the model (only once)."""
         if not self.has_adapter:
             return
-            
-        # Check if adapter is already loaded
+        
+        # Check if adapter is already loaded (PeftModel wrapper exists)
         if self._lora_loaded:
-            # Adapter already loaded, just ensure it's active
+            # Adapter already loaded, just activate it
+            self._model.enable_adapters()
             self._model.set_adapter("lora_adapter")
+            self._lora_active = True
+            print("LoRA adapter activated (already loaded).")
             return
         
         # Adapter not loaded, load it
         print("Loading LoRA adapter...")
         from peft import PeftModel
         
-        try:
-            # Wrap model with PeftModel and load adapter
-            self._model = PeftModel.from_pretrained(
-                self._model,
-                str(self.adapter_path),
-                adapter_name="lora_adapter",
-            )
-            # Set active adapter to use LoRA
-            self._model.set_adapter("lora_adapter")
-            self._lora_loaded = True
-            print("LoRA adapter loaded.")
-        except Exception as e:
-            # If adapter already exists, just activate it
-            if "already exists" in str(e):
-                print("LoRA adapter already exists, activating...")
-                self._model.set_adapter("lora_adapter")
-                self._lora_loaded = True
-            else:
-                raise
+        # Wrap model with PeftModel and load adapter
+        self._model = PeftModel.from_pretrained(
+            self._model,
+            str(self.adapter_path),
+            adapter_name="lora_adapter",
+        )
+        # Set active adapter to use LoRA
+        self._model.enable_adapters()
+        self._model.set_adapter("lora_adapter")
+        self._lora_loaded = True
+        self._lora_active = True
+        print("LoRA adapter loaded and activated.")
 
     def _unload_lora(self):
-        """Unload the LoRA adapter (keep base model loaded)."""
-        if self._lora_loaded:
-            # Unload the adapter properly
-            # This keeps the base model loaded without LoRA weights
-            self._model.unload()
-            self._lora_loaded = False
-            print("LoRA adapter unloaded.")
+        """Disable the LoRA adapter (keep it loaded but don't use it)."""
+        if self._lora_active:
+            # Disable the adapter using PeftModel's disable_adapter()
+            self._model.disable_adapter()
+            self._lora_active = False
+            print("LoRA adapter disabled (kept in memory).")
 
     def _format_prompt(self, question: str, schema_text: str) -> str:
         """Format the input prompt using the instruction template."""
@@ -268,8 +265,8 @@ class SchemaLinker:
         # Load base model (without LoRA)
         self._load_model()
 
-        # Ensure LoRA is not loaded
-        if self._lora_loaded:
+        # Ensure LoRA is not active
+        if self._lora_active:
             self._unload_lora()
 
         # Tokenize
