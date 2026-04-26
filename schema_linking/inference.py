@@ -103,25 +103,25 @@ class SchemaLinker:
             schema_text=schema_text,
         )
 
-    def _get_llm(self, use_lora: bool = True):
-        """Get or create the vLLM engine instance."""
+    def _get_llm(self):
+        """Get or create the vLLM engine instance (created once with LoRA support enabled)."""
         if self._llm is None:
             llm = self.LLM(
                 model=self.base_model_name,
                 tensor_parallel_size=self.tensor_parallel_size,
                 max_model_len=self.max_seq_length,
                 dtype="bfloat16",
-                enable_lora=use_lora,
-                max_loras=4 if use_lora else 0,
-                max_lora_rank=LORA_R if use_lora else 0,
+                enable_lora=True,  # Always enable LoRA support
+                max_loras=4,
+                max_lora_rank=LORA_R,
                 enforce_eager=False,
                 trust_remote_code=True,
                 disable_log_stats=True,
             )
             self._llm = llm
-            if use_lora:
-                from vllm.lora.request import LoRARequest
-                self._lora_request = LoRARequest("schema_linking", 1, str(self.adapter_path))
+            # Create LoRA request for schema linking
+            from vllm.lora.request import LoRARequest
+            self._lora_request = LoRARequest("schema_linking", 1, str(self.adapter_path))
         return self._llm
 
     def _create_sampling_params(self, max_new_tokens: int):
@@ -174,8 +174,8 @@ class SchemaLinker:
 
         Reuses the same LLM instance with LoRA adapter loaded.
         """
-        # Get or create the vLLM engine with LoRA
-        llm = self._get_llm(use_lora=True)
+        # Get the shared LLM instance (created with LoRA support, we'll use lora_request=self._lora_request)
+        llm = self._get_llm()
         sampling_params = self._create_sampling_params(max_new_tokens)
 
         # Format all prompts
@@ -224,8 +224,8 @@ class SchemaLinker:
         Returns:
             List of generated text strings
         """
-        # Get or create the vLLM engine WITHOUT LoRA support
-        llm = self._get_llm(use_lora=False)
+        # Get the shared LLM instance (created with LoRA support, but we'll use lora_request=None)
+        llm = self._get_llm()
         sampling_params = self.SamplingParams(
             max_tokens=max_new_tokens,
             temperature=0.1,
