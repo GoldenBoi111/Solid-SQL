@@ -171,7 +171,7 @@ class QuestionSkeletonExtractor:
             truncation=True,
             max_length=self.max_seq_length,
             return_tensors="pt",
-        ).to(self._model.device)
+        ).to(next(self._model.parameters()).device)
 
         # Generate
         all_results = []
