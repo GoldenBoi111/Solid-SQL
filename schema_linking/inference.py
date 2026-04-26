@@ -150,13 +150,13 @@ class SchemaLinker:
                 raise
 
     def _unload_lora(self):
-        """Disable the LoRA adapter (keep it loaded but don't use it)."""
+        """Unload the LoRA adapter (keep base model loaded)."""
         if self._lora_loaded:
-            # Disable the adapter, keep it loaded in memory
-            # This avoids memory fragmentation from reloading
-            self._model.disable_adapter()
+            # Unload the adapter properly
+            # This keeps the base model loaded without LoRA weights
+            self._model.unload()
             self._lora_loaded = False
-            print("LoRA adapter disabled (kept in memory).")
+            print("LoRA adapter unloaded.")
 
     def _format_prompt(self, question: str, schema_text: str) -> str:
         """Format the input prompt using the instruction template."""
