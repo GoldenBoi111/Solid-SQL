@@ -129,7 +129,7 @@ class SchemaLinker:
         """Disable the LoRA adapter (keep it loaded but don't use it)."""
         if self._lora_active:
             # Disable the active adapter without unloading its weights
-            self._model.disable_adapter()
+            self._model.disable_adapters()
             self._lora_active = False
             print("LoRA adapter disabled (kept in memory).")
 
