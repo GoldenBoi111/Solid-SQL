@@ -431,7 +431,7 @@ class SkeletonRetriever:
         """
         # Load metadata from JSON
         metadata_path = Path(path)
-        if metadata_path.suffix == ".metadata.json":
+        if metadata_path.name.endswith(".metadata.json"):
             # If path already ends with .metadata.json, use it directly
             pass
         else:
