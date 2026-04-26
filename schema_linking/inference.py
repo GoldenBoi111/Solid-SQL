@@ -150,21 +150,13 @@ class SchemaLinker:
                 raise
 
     def _unload_lora(self):
-        """Unload the LoRA adapter by merging weights."""
+        """Disable the LoRA adapter (keep it loaded but don't use it)."""
         if self._lora_loaded:
-            print("Merging LoRA weights into base model...")
-            from peft import PeftModel
-
-            # Merge LoRA weights into base model
-            # This returns a new model, but we keep the same reference
-            merged_model = self._model.merge_and_unload()
-
-            # Copy state dict back to original model to maintain reference
-            self._model.load_state_dict(merged_model.state_dict(), strict=False)
-            del merged_model
-
+            # Just disable the adapter, keep it loaded in memory
+            # This avoids memory fragmentation from reloading
+            self._model.set_adapter("base_model")
             self._lora_loaded = False
-            print("LoRA adapter merged into base model.")
+            print("LoRA adapter disabled (kept in memory).")
 
     def _format_prompt(self, question: str, schema_text: str) -> str:
         """Format the input prompt using the instruction template."""
