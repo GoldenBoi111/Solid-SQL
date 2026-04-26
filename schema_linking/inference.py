@@ -203,7 +203,9 @@ class SchemaLinker:
                     output_type=SchemaLinkingOutput,
                     max_new_tokens=max_new_tokens,
                 )
-                all_results.append(self._output_to_dict(output))
+                all_results.append(
+                    SchemaLinkingOutput.model_validate_json(output).model_dump()
+                )
 
             if show_progress:
                 processed = min(i + batch_size, total)
@@ -251,7 +253,7 @@ class SchemaLinker:
                     output_type=SQLOutput,
                     max_new_tokens=max_new_tokens,
                 )
-                all_outputs.append(output.sql)
+                all_outputs.append(SQLOutput.model_validate_json(output).sql)
 
             if show_progress:
                 processed = min(i + batch_size, total)
@@ -311,14 +313,3 @@ class SchemaLinker:
         conn.close()
 
         return self.predict(question, schema_text, max_new_tokens)
-
-    @staticmethod
-    def _output_to_dict(output) -> Dict:
-        """Convert an Outlines output object to a plain dictionary."""
-        if hasattr(output, "model_dump"):
-            return output.model_dump()
-        if hasattr(output, "dict"):
-            return output.dict()
-        if isinstance(output, dict):
-            return output
-        return {"error": f"Unexpected output type: {type(output).__name__}"}
