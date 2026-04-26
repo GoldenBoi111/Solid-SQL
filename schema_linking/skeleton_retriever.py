@@ -417,18 +417,27 @@ class SkeletonRetriever:
         print(f"Metadata saved to: {metadata_path}")
         print(f"Index base path: {path}")
 
-    def load_index(self, path: str, load_faiss: bool = True) -> None:
+    def load_index(self, path: str, question_index_path: str = None, sql_index_path: str = None, load_faiss: bool = True) -> None:
         """
         Load a previously saved index from disk.
 
         Loads FAISS indexes from binary files and metadata from JSON.
 
         Args:
-            path: Base path of the saved index
+            path: Base path of the saved index or path to .metadata.json file
+            question_index_path: Optional path to question FAISS index (overrides auto-detection)
+            sql_index_path: Optional path to SQL FAISS index (overrides auto-detection)
             load_faiss: Whether to load FAISS indexes
         """
         # Load metadata from JSON
-        metadata_path = Path(path).with_suffix(".metadata.json")
+        metadata_path = Path(path)
+        if metadata_path.suffix == ".metadata.json":
+            # If path already ends with .metadata.json, use it directly
+            pass
+        else:
+            # Otherwise, construct the metadata path
+            metadata_path = Path(path).with_suffix(".metadata.json")
+        
         with open(metadata_path, "r", encoding="utf-8") as f:
             index_data = json.load(f)
 
@@ -438,8 +447,16 @@ class SkeletonRetriever:
 
         # Load FAISS indexes from binary files if available
         if load_faiss and FAISS_AVAILABLE:
-            question_index_path = Path(path).with_suffix(".question.index")
-            sql_index_path = Path(path).with_suffix(".sql.index")
+            # Use provided paths or auto-detect
+            if question_index_path:
+                question_index_path = Path(question_index_path)
+            else:
+                question_index_path = Path(path).with_suffix(".question.index")
+            
+            if sql_index_path:
+                sql_index_path = Path(sql_index_path)
+            else:
+                sql_index_path = Path(path).with_suffix(".sql.index")
 
             if question_index_path.exists():
                 self.question_index = faiss.read_index(str(question_index_path))

@@ -307,14 +307,16 @@ build_index: bool = True,
         """
         self.retriever.save_index(path)
 
-    def load_retrieval_index(self, path: str) -> None:
+    def load_retrieval_index(self, path: str, question_index_path: str = None, sql_index_path: str = None) -> None:
         """
         Load a previously saved retrieval index.
 
         Args:
-            path: Path to the saved index
+            path: Path to the saved index or metadata JSON file
+            question_index_path: Optional path to question FAISS index
+            sql_index_path: Optional path to SQL FAISS index
         """
-        self.retriever.load_index(path)
+        self.retriever.load_index(path, question_index_path=question_index_path, sql_index_path=sql_index_path)
 
     ['prompt], sampling_params, lora_request=lora_request)\n        \n        if outputs:\n            skeleton = outputs[0].outputs[0].text.strip()\n            # Clean up the response (same as QuestionSkeletonExtractor)\n            skeleton = self._clean_skeleton_response(skeleton)\n            return skeleton\n        return "', 'def _format_skeleton_prompt(self, question: str) -> str:\n        "', 'Format prompt for question skeleton extraction."', '\n        from schema_linking.question_skeleton_extractor import SKELETON_EXTRACTION_PROMPT\n        return SKELETON_EXTRACTION_PROMPT.format(question=question)\n        \n    def _clean_skeleton_response(self, response: str) -> str:\n        "', 'Clean up the LLM response (same as QuestionSkeletonExtractor)."', '\n        response = response.strip()\n\n        # Remove quotes if present\n        if response.startswith(\'"\') and response.endswith(\'', '):\n            response = response[1:-1]\n        elif response.startswith("\'") and response.endswith("', '):\n            response = response[1:-1]\n\n        # Remove any trailing explanations after the skeleton\n        # (in case the model didn\'t follow instructions perfectly)\n        if "\n" in response:\n            response = response.split("', [0], '.', 'strip()\n\n        return response']
 

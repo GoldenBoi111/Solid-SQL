@@ -306,7 +306,9 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate SolidSQL pipeline")
     parser.add_argument("--questions", required=True, help="Path to questions JSON file")
     parser.add_argument("--databases", required=True, help="Path to databases directory")
-    parser.add_argument("--indices", required=True, help="Path to FAISS indices")
+    parser.add_argument("--metadata-index", required=True, help="Path to metadata JSON file (e.g., retrieval_index.metadata.json)")
+    parser.add_argument("--question-index", required=False, help="Path to question FAISS index file (optional)")
+    parser.add_argument("--sql-index", required=False, help="Path to SQL FAISS index file (optional)")
     parser.add_argument("--adapter", default="./schema_linking_output/lora_adapter", 
                         help="Path to LoRA adapter")
     parser.add_argument("--output", default="evaluation_results.json", 
@@ -323,8 +325,8 @@ def main():
         print(f"Error: Databases directory not found: {args.databases}")
         return
     
-    if not os.path.exists(args.indices):
-        print(f"Error: Indices file not found: {args.indices}")
+    if not os.path.exists(args.metadata_index):
+        print(f"Error: Metadata index file not found: {args.metadata_index}")
         return
     
     # Load questions
@@ -342,8 +344,12 @@ def main():
     )
     
     # Load pre-built FAISS indices
-    print(f"Loading FAISS indices from {args.indices}...")
-    solidsql.load_retrieval_index(args.indices)
+    print(f"Loading FAISS indices from {args.metadata_index}...")
+    solidsql.load_retrieval_index(
+        args.metadata_index,
+        question_index_path=args.question_index,
+        sql_index_path=args.sql_index
+    )
     
     # Evaluate questions
     print("Starting evaluation...")
