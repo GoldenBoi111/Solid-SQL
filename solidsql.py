@@ -122,7 +122,6 @@ build_index: bool = True,
             Dictionary with full generation results including intermediate steps
         """
         # Step 1: Schema linking with LoRA adapter
-        self.schema_linker.set_keep_alive(True)
         schema_result = self.schema_linker.predict(
             question=question,
             schema_text=schema_text,
@@ -135,15 +134,12 @@ build_index: bool = True,
             schema_text=schema_text,
             max_new_tokens=max_new_tokens,
         )
-        
-        # Shutdown schema linker to free memory (we don't need it anymore)
-        self.schema_linker.set_keep_alive(False)
 
         # Step 2: Extract question skeleton for retrieval (if not skipped)
         question_skeleton = None
         if not self.skip_skeleton_extraction and self.q_extractor is not None:
             question_skeleton = self.q_extractor.extract(question)
-        elif self.skip_skeleton_extraction and hasattr(self.schema_linker, '_llm') and self.schema_linker._llm is not None:
+        elif self.skip_skeleton_extraction:
             # Use the SchemaLinker's LLM for question skeleton extraction
             question_skeleton = self._extract_skeleton_with_shared_llm(question)
 
@@ -170,7 +166,6 @@ build_index: bool = True,
             examples_text = "\n\n".join(examples_context)
             
             # Create prompt for round 2 SQL generation
-            # This uses the base model WITHOUT LoRA adapter
             round_2_prompt = (
                 "Given a natural language question, database schema, examples of similar questions with their SQL queries, "
                 "and a preliminary SQL query, generate a refined SQL query to answer the question.\n\n"
@@ -183,36 +178,14 @@ build_index: bool = True,
             
             # Generate SQL using the schema linker's LLM without LoRA adapter
             try:
-                from vllm import SamplingParams
-                
-                # Get the schema linker's LLM instance
-                sql_generator = self.schema_linker._llm
-                
-                if sql_generator is None:
-                    # Create new LLM if schema linker hasn't run yet
-                    from vllm import LLM
-                    sql_generator = LLM(
-                        model=self.schema_linker.base_model_name,
-                        tensor_parallel_size=1,
-                        max_model_len=4096,
-                        dtype="bfloat16",
-                        enforce_eager=False,
-                        trust_remote_code=True,
-                        disable_log_stats=True,
-                    )
-                    self.schema_linker._llm = sql_generator
-                
-                sampling_params = SamplingParams(
-                    max_tokens=512,
-                    temperature=0.1,
-                    top_p=0.95,
+                outputs = self.schema_linker.generate_without_lora(
+                    [round_2_prompt],
+                    max_new_tokens=512,
+                    show_progress=False,
                 )
                 
-                # Generate SQL WITHOUT LoRA adapter (pass None lora_request)
-                outputs = sql_generator.generate([round_2_prompt], sampling_params, lora_request=None)
-                
                 if outputs:
-                    refined_sql = outputs[0].outputs[0].text.strip()
+                    refined_sql = outputs[0].strip()
                     # Clean up the SQL output
                     refined_sql = self._clean_sql_output(refined_sql)
                     
@@ -324,14 +297,46 @@ build_index: bool = True,
 
     def _extract_skeleton_with_shared_llm(self, question: str) -> str:
         """Extract question skeleton using the SchemaLinker's shared LLM."""
-        # Check if we have a shared LLM from schema linking
-        if hasattr(self.schema_linker, '_llm') and self.schema_linker._llm is not None:
-            return self._extract_skeleton_with_llm(self.schema_linker._llm, question)
-        else:
-            # Fallback to regular extractor if no shared LLM
-            if self.q_extractor is not None:
-                return self.q_extractor.extract(question)
-            return ""
+        from schema_linking.question_skeleton_extractor import SKELETON_EXTRACTION_PROMPT
+        
+        skeleton_prompt = SKELETON_EXTRACTION_PROMPT.format(question=question)
+        
+        # Use the SchemaLinker's LLM without LoRA adapter
+        try:
+            outputs = self.schema_linker.generate_without_lora(
+                [skeleton_prompt],
+                max_new_tokens=256,
+                show_progress=False,
+            )
+            
+            if outputs:
+                skeleton = outputs[0].strip()
+                # Clean up the response
+                skeleton = self._clean_skeleton_response(skeleton)
+                return skeleton
+        except Exception as e:
+            print(f"Warning: Failed to extract skeleton with shared LLM: {e}")
+        
+        # Fallback to regular extractor if shared LLM fails
+        if self.q_extractor is not None:
+            return self.q_extractor.extract(question)
+        return ""
+    
+    def _clean_skeleton_response(self, response: str) -> str:
+        """Clean up the LLM response for skeleton extraction."""
+        response = response.strip()
+        
+        # Remove quotes if present
+        if response.startswith('"') and response.endswith('"'):
+            response = response[1:-1]
+        elif response.startswith("'") and response.endswith("'"):
+            response = response[1:-1]
+        
+        # Remove any trailing explanations after the skeleton
+        if "\n" in response:
+            response = response.split("\n")[0].strip()
+        
+        return response
             
     def _generate_sql_with_base_model(self, question: str, schema_text: str, max_new_tokens: int = 512) -> str:
         """
@@ -339,10 +344,7 @@ build_index: bool = True,
         
         Reuses the same LLM instance from schema linking to avoid reloading.
         """
-        from vllm import SamplingParams
-        from vllm.lora.request import LoRARequest
-        
-        # SQL generation prompt (same as before)
+        # SQL generation prompt
         sql_prompt = (
             "Given a natural language question and a database schema, "
             "generate a SQL query to answer the question.\n\n"
@@ -355,40 +357,22 @@ build_index: bool = True,
             "SQL:\n"
         ).format(question=question, schema_text=schema_text)
         
-        # Get the schema linker's LLM instance
-        llm = self.schema_linker._llm
-        
-        if llm is None:
-            # Create new LLM if schema linker hasn't run yet
-            from vllm import LLM
-            llm = LLM(
-                model=self.schema_linker.base_model_name,
-                tensor_parallel_size=1,
-                max_model_len=4096,
-                dtype="bfloat16",
-                enforce_eager=False,
-                trust_remote_code=True,
-                disable_log_stats=True,
+        # Use the SchemaLinker's generate_without_lora method
+        try:
+            outputs = self.schema_linker.generate_without_lora(
+                [sql_prompt],
+                max_new_tokens=max_new_tokens,
+                show_progress=False,
             )
-            self.schema_linker._llm = llm
-        
-        sampling_params = SamplingParams(
-            max_tokens=max_new_tokens,
-            temperature=0.1,
-            top_p=0.95,
-        )
-        
-        # Generate SQL WITHOUT LoRA adapter (pass None lora_request)
-        outputs = llm.generate([sql_prompt], sampling_params, lora_request=None)
-        
-        if outputs:
-            sql = outputs[0].outputs[0].text.strip()
-            sql = self._clean_sql_output(sql)
-        else:
+            
+            if outputs:
+                sql = outputs[0].strip()
+                sql = self._clean_sql_output(sql)
+            else:
+                sql = ""
+        except Exception as e:
+            print(f"Warning: Failed to generate SQL with shared LLM: {e}")
             sql = ""
-        
-        # vLLM v0.19+ manages engine lifecycle automatically
-        # No manual shutdown needed
         
         return sql
     
@@ -428,11 +412,6 @@ build_index: bool = True,
             
         return cleaned_sql.strip()
             
-    def shutdown(self):
-        """Shut down the schema linker to free resources."""
-        if hasattr(self, 'schema_linker'):
-            self.schema_linker.shutdown()
-    
     def shutdown(self):
         """Shut down the schema linker to free resources."""
         if hasattr(self, 'schema_linker'):

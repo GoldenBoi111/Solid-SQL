@@ -72,6 +72,8 @@ class SchemaLinker:
         self.base_model_name = base_model
         self.max_seq_length = max_seq_length
         self.tensor_parallel_size = tensor_parallel_size
+        self._llm = None
+        self._lora_request = None
 
         # Import vLLM here to defer the dependency until use time
         try:
@@ -101,21 +103,26 @@ class SchemaLinker:
             schema_text=schema_text,
         )
 
-    def _create_vllm(self):
-        """Create a vLLM engine instance with LoRA support enabled."""
-        llm = self.LLM(
-            model=self.base_model_name,
-            tensor_parallel_size=self.tensor_parallel_size,
-            max_model_len=self.max_seq_length,
-            dtype="bfloat16",
-            enable_lora=True,
-            max_loras=4,
-            max_lora_rank=LORA_R,
-            enforce_eager=False,
-            trust_remote_code=True,
-            disable_log_stats=True,
-        )
-        return llm
+    def _get_llm(self, use_lora: bool = True):
+        """Get or create the vLLM engine instance."""
+        if self._llm is None:
+            llm = self.LLM(
+                model=self.base_model_name,
+                tensor_parallel_size=self.tensor_parallel_size,
+                max_model_len=self.max_seq_length,
+                dtype="bfloat16",
+                enable_lora=use_lora,
+                max_loras=4 if use_lora else 0,
+                max_lora_rank=LORA_R if use_lora else 0,
+                enforce_eager=False,
+                trust_remote_code=True,
+                disable_log_stats=True,
+            )
+            self._llm = llm
+            if use_lora:
+                from vllm.lora.request import LoRARequest
+                self._lora_request = LoRARequest("schema_linking", 1, str(self.adapter_path))
+        return self._llm
 
     def _create_sampling_params(self, max_new_tokens: int):
         """Create SamplingParams with structured JSON output."""
@@ -165,17 +172,11 @@ class SchemaLinker:
         """
         Generate predictions for multiple questions.
 
-        Loads the LoRA adapter once for the entire batch,
-        then unloads it when done.
+        Reuses the same LLM instance with LoRA adapter loaded.
         """
-        from vllm.lora.request import LoRARequest
-
-        lora_path = str(self.adapter_path)
-
-        # Create vLLM engine with LoRA support
-        llm = self._create_vllm()
+        # Get or create the vLLM engine with LoRA
+        llm = self._get_llm(use_lora=True)
         sampling_params = self._create_sampling_params(max_new_tokens)
-        lora_request = LoRARequest("schema_linking", 1, lora_path)
 
         # Format all prompts
         prompts = [
@@ -189,7 +190,7 @@ class SchemaLinker:
 
         for i in range(0, total, batch_size):
             batch_prompts = prompts[i : i + batch_size]
-            outputs = llm.generate(batch_prompts, sampling_params, lora_request=lora_request)
+            outputs = llm.generate(batch_prompts, sampling_params, lora_request=self._lora_request)
 
             for output in outputs:
                 response = output.outputs[0].text
@@ -200,14 +201,67 @@ class SchemaLinker:
                 processed = min(i + batch_size, total)
                 print(f"  Processed {processed}/{total}")
 
-        # vLLM v0.19+ manages engine lifecycle automatically
-        # No manual shutdown needed
-
         return all_results
+
+    def generate_without_lora(
+        self,
+        prompts: List[str],
+        max_new_tokens: int = 512,
+        batch_size: int = 16,
+        show_progress: bool = True,
+    ) -> List[str]:
+        """
+        Generate text using the base model WITHOUT LoRA adapter.
+        
+        Reuses the same LLM instance but without loading the LoRA adapter.
+        
+        Args:
+            prompts: List of prompt strings to generate from
+            max_new_tokens: Maximum tokens to generate
+            batch_size: Batch size for generation
+            show_progress: Whether to show progress
+            
+        Returns:
+            List of generated text strings
+        """
+        # Get or create the vLLM engine WITHOUT LoRA support
+        llm = self._get_llm(use_lora=False)
+        sampling_params = self.SamplingParams(
+            max_tokens=max_new_tokens,
+            temperature=0.1,
+            top_p=0.95,
+        )
+
+        # Generate in sub-batches for memory efficiency
+        all_outputs = []
+        total = len(prompts)
+
+        for i in range(0, total, batch_size):
+            batch_prompts = prompts[i : i + batch_size]
+            outputs = llm.generate(batch_prompts, sampling_params, lora_request=None)
+
+            for output in outputs:
+                all_outputs.append(output.outputs[0].text)
+
+            if show_progress:
+                processed = min(i + batch_size, total)
+                print(f"  Processed {processed}/{total}")
+
+        return all_outputs
 
     def set_keep_alive(self, keep_alive: bool = True):
         """Set whether to keep the LLM alive between calls."""
         self._keep_alive = keep_alive
+
+    def shutdown(self):
+        """Shut down the LLM engine to free resources."""
+        if hasattr(self, '_llm') and self._llm is not None:
+            try:
+                self._llm.shutdown()
+            except:
+                pass
+            self._llm = None
+            self._lora_request = None
 
     def predict_from_db_id(
         self,
