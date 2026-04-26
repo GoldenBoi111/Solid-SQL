@@ -106,25 +106,48 @@ class SchemaLinker:
             print("Base model loaded.")
 
     def _load_lora(self):
-        """Load the LoRA adapter into the model."""
-        if self.has_adapter:
-            if not self._lora_loaded:
-                print("Loading LoRA adapter...")
-                from peft import PeftModel
-
-                # Load adapter
-                self._model.load_adapter(
-                    str(self.adapter_path),
-                    adapter_name="lora_adapter",
-                )
-                # Set active adapter to use LoRA
-                self._model.set_adapter(["base_model", "lora_adapter"])
+        """Load the LoRA adapter into the model (only once)."""
+        if not self.has_adapter:
+            return
+            
+        # Check if adapter is already loaded by checking active adapters
+        if hasattr(self._model, "active_adapters"):
+            if "lora_adapter" in self._model.active_adapters:
+                # Adapter already loaded and active
+                return
+        
+        # Adapter not loaded, load it
+        print("Loading LoRA adapter...")
+        from peft import PeftModel
+        
+        try:
+            # Load adapter
+            self._model.load_adapter(
+                str(self.adapter_path),
+                adapter_name="lora_adapter",
+            )
+            # Set active adapter to use LoRA
+            self._model.set_adapter("lora_adapter")
+            self._lora_loaded = True
+            print("LoRA adapter loaded.")
+        except Exception as e:
+            # If adapter already exists, just activate it
+            if "already exists" in str(e):
+                print("LoRA adapter already exists, activating...")
+                self._model.set_adapter("lora_adapter")
                 self._lora_loaded = True
-                print("LoRA adapter loaded.")
             else:
-                # Adapter already loaded, just activate it
-                print("LoRA adapter already loaded, activating...")
-                self._model.set_adapter(["base_model", "lora_adapter"])
+                raise
+            self._lora_loaded = True
+            print("LoRA adapter loaded.")
+        except Exception as e:
+            # If adapter already exists, just activate it
+            if "already exists" in str(e):
+                print("LoRA adapter already exists, activating...")
+                self._model.set_adapter("lora_adapter")
+                self._lora_loaded = True
+            else:
+                raise
 
     def _unload_lora(self):
         """Unload the LoRA adapter by merging weights."""
