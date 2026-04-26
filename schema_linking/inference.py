@@ -105,24 +105,32 @@ class SchemaLinker:
             print("Loading LoRA adapter...")
             from peft import PeftModel
             
-            self._model = PeftModel.from_pretrained(
-                self._model,
+            # Load adapter
+            self._model.load_adapter(
                 str(self.adapter_path),
                 adapter_name="lora_adapter",
             )
+            # Set active adapter to use LoRA
+            self._model.set_adapter(["base_model", "lora_adapter"])
             self._lora_loaded = True
             print("LoRA adapter loaded.")
 
     def _unload_lora(self):
-        """Unload the LoRA adapter from the model."""
+        """Unload the LoRA adapter by merging weights."""
         if self._lora_loaded:
-            print("Unloading LoRA adapter...")
+            print("Merging LoRA weights into base model...")
             from peft import PeftModel
             
-            # Convert back to base model
-            self._model = self._model.merge_and_unload()
+            # Merge LoRA weights into base model
+            # This returns a new model, but we keep the same reference
+            merged_model = self._model.merge_and_unload()
+            
+            # Copy state dict back to original model to maintain reference
+            self._model.load_state_dict(merged_model.state_dict(), strict=False)
+            del merged_model
+            
             self._lora_loaded = False
-            print("LoRA adapter unloaded.")
+            print("LoRA adapter merged into base model.")
 
     def _format_prompt(self, question: str, schema_text: str) -> str:
         """Format the input prompt using the instruction template."""
@@ -216,8 +224,8 @@ class SchemaLinker:
                     processed = min(i + batch_size, total)
                     print(f"  Processed {processed}/{total}")
 
-        # Unload LoRA adapter
-        self._unload_lora()
+        # Keep LoRA adapter loaded - don't unload to avoid memory fragmentation
+        # The adapter weights are small compared to the base model
 
         return all_results
 
