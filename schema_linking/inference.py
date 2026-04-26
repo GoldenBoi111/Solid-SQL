@@ -33,8 +33,11 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import (
-    MODEL_NAME, OUTPUT_DIR, MAX_SEQ_LENGTH,
-    INSTRUCTION_TEMPLATE, OUTPUT_SCHEMA,
+    MODEL_NAME,
+    OUTPUT_DIR,
+    MAX_SEQ_LENGTH,
+    INSTRUCTION_TEMPLATE,
+    OUTPUT_SCHEMA,
     LORA_R,
 )
 from .schema_formatter import format_schema_compact, load_schemas_from_dir
@@ -61,8 +64,11 @@ class SchemaLinker:
             adapter_path = str(Path(OUTPUT_DIR) / "lora_adapter")
 
         self.adapter_path = Path(adapter_path)
-        self.has_adapter = self.adapter_path.is_dir() and (self.adapter_path / "adapter_config.json").exists()
-        
+        self.has_adapter = (
+            self.adapter_path.is_dir()
+            and (self.adapter_path / "adapter_config.json").exists()
+        )
+
         self.base_model_name = base_model
         self.max_seq_length = max_seq_length
         self._model = None
@@ -85,11 +91,11 @@ class SchemaLinker:
                 self.base_model_name,
                 trust_remote_code=True,
             )
-            
+
             # Set pad token if not set
             if self._tokenizer.pad_token is None:
                 self._tokenizer.pad_token = self._tokenizer.eos_token
-            
+
             self._model = AutoModelForCausalLM.from_pretrained(
                 self.base_model_name,
                 trust_remote_code=True,
@@ -101,34 +107,39 @@ class SchemaLinker:
 
     def _load_lora(self):
         """Load the LoRA adapter into the model."""
-        if self.has_adapter and not self._lora_loaded:
-            print("Loading LoRA adapter...")
-            from peft import PeftModel
-            
-            # Load adapter
-            self._model.load_adapter(
-                str(self.adapter_path),
-                adapter_name="lora_adapter",
-            )
-            # Set active adapter to use LoRA
-            self._model.set_adapter(["base_model", "lora_adapter"])
-            self._lora_loaded = True
-            print("LoRA adapter loaded.")
+        if self.has_adapter:
+            if not self._lora_loaded:
+                print("Loading LoRA adapter...")
+                from peft import PeftModel
+
+                # Load adapter
+                self._model.load_adapter(
+                    str(self.adapter_path),
+                    adapter_name="lora_adapter",
+                )
+                # Set active adapter to use LoRA
+                self._model.set_adapter(["base_model", "lora_adapter"])
+                self._lora_loaded = True
+                print("LoRA adapter loaded.")
+            else:
+                # Adapter already loaded, just activate it
+                print("LoRA adapter already loaded, activating...")
+                self._model.set_adapter(["base_model", "lora_adapter"])
 
     def _unload_lora(self):
         """Unload the LoRA adapter by merging weights."""
         if self._lora_loaded:
             print("Merging LoRA weights into base model...")
             from peft import PeftModel
-            
+
             # Merge LoRA weights into base model
             # This returns a new model, but we keep the same reference
             merged_model = self._model.merge_and_unload()
-            
+
             # Copy state dict back to original model to maintain reference
             self._model.load_state_dict(merged_model.state_dict(), strict=False)
             del merged_model
-            
+
             self._lora_loaded = False
             print("LoRA adapter merged into base model.")
 
@@ -181,7 +192,7 @@ class SchemaLinker:
         """
         # Load base model
         self._load_model()
-        
+
         # Load LoRA adapter
         self._load_lora()
 
@@ -209,12 +220,12 @@ class SchemaLinker:
                 batch_inputs = {
                     k: v[i : i + batch_size] for k, v in inputs_tokenized.items()
                 }
-                
+
                 outputs = self._model.generate(
                     **batch_inputs,
                     **self._create_sampling_params(max_new_tokens),
                 )
-                
+
                 for output in outputs:
                     response = self._tokenizer.decode(output, skip_special_tokens=True)
                     parsed = self._parse_json_response(response)
@@ -238,13 +249,13 @@ class SchemaLinker:
     ) -> List[str]:
         """
         Generate text using the base model WITHOUT LoRA adapter.
-        
+
         Args:
             prompts: List of prompt strings to generate from
             max_new_tokens: Maximum tokens to generate
             batch_size: Batch size for generation
             show_progress: Whether to show progress
-            
+
         Returns:
             List of generated text strings
         """
@@ -273,14 +284,16 @@ class SchemaLinker:
                 batch_inputs = {
                     k: v[i : i + batch_size] for k, v in inputs_tokenized.items()
                 }
-                
+
                 outputs = self._model.generate(
                     **batch_inputs,
                     **self._create_sampling_params(max_new_tokens),
                 )
-                
+
                 for output in outputs:
-                    all_outputs.append(self._tokenizer.decode(output, skip_special_tokens=True))
+                    all_outputs.append(
+                        self._tokenizer.decode(output, skip_special_tokens=True)
+                    )
 
                 if show_progress:
                     processed = min(i + batch_size, total)
@@ -320,9 +333,12 @@ class SchemaLinker:
             return {"error": f"No schema found for db_id '{db_id}' at {db_root}"}
 
         import sqlite3
+
         conn = sqlite3.connect(str(db_path))
         cursor = conn.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;")
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;"
+        )
         tables = cursor.fetchall()
         parts = []
         for (tbl,) in tables:
