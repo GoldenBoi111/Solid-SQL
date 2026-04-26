@@ -73,7 +73,7 @@ class SchemaLinker:
         self.max_seq_length = max_seq_length
         self._model = None
         self._tokenizer = None
-        self._lora_loaded = False  # True once PeftModel wrapper exists (never resets)
+        self._lora_loaded = False  # True once the adapter has been loaded (never resets)
         self._lora_active = False   # True when adapter is currently applied
 
         print(f"\n{'='*60}")
@@ -97,26 +97,21 @@ class SchemaLinker:
             if self._tokenizer.pad_token is None:
                 self._tokenizer.pad_token = self._tokenizer.eos_token
 
-            # Load model WITHOUT device_map to avoid hf_quantizer error
+            # Load model with automatic device placement
             self._model = AutoModelForCausalLM.from_pretrained(
                 self.base_model_name,
                 trust_remote_code=True,
                 torch_dtype=torch.bfloat16,
+                device_map="auto",
             )
 
-            # If adapter exists, wrap with PeftModel BEFORE moving to GPU
+            # If adapter exists, load it onto the model before use
             if self.has_adapter and not self._lora_loaded:
-                from peft import PeftModel
                 print("Loading LoRA adapter (first time)...")
-                self._model = PeftModel.from_pretrained(
-                    self._model,
-                    str(self.adapter_path),
-                    adapter_name="lora_adapter",
-                )
+                self._model.load_adapter(str(self.adapter_path), adapter_name="lora_adapter")
                 self._lora_loaded = True
 
-            # Move to GPU and set to eval mode
-            self._model = self._model.to("cuda")
+            # Set model to eval mode
             self._model.eval()
             print("Base model loaded.")
 
@@ -125,8 +120,7 @@ class SchemaLinker:
         if not self.has_adapter:
             return
         
-        # Adapter is already wrapped in PeftModel during _load_model,
-        # just activate it
+        # Adapter is already loaded in _load_model, just activate it
         self._model.enable_adapters()
         self._model.set_adapter("lora_adapter")
         self._lora_active = True
@@ -134,7 +128,7 @@ class SchemaLinker:
     def _unload_lora(self):
         """Disable the LoRA adapter (keep it loaded but don't use it)."""
         if self._lora_active:
-            # Disable the adapter using PeftModel's disable_adapter()
+            # Disable the active adapter without unloading its weights
             self._model.disable_adapter()
             self._lora_active = False
             print("LoRA adapter disabled (kept in memory).")
