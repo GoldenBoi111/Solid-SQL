@@ -152,9 +152,9 @@ class SchemaLinker:
     def _unload_lora(self):
         """Disable the LoRA adapter (keep it loaded but don't use it)."""
         if self._lora_loaded:
-            # Just disable the adapter, keep it loaded in memory
+            # Disable the adapter, keep it loaded in memory
             # This avoids memory fragmentation from reloading
-            self._model.set_adapter("base_model")
+            self._model.disable_adapter()
             self._lora_loaded = False
             print("LoRA adapter disabled (kept in memory).")
 
