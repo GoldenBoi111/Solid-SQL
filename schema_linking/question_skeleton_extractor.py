@@ -26,6 +26,9 @@ import json
 from pathlib import Path
 from typing import List, Optional
 
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
 from .config import MODEL_NAME
 
 
@@ -65,58 +68,28 @@ Skeleton (Q⋆):"""
 
 
 class QuestionSkeletonExtractor:
-    """Extracts structural skeletons from natural language questions using LLM."""
+    """Extracts structural skeletons from natural language questions using transformers."""
 
     def __init__(
         self,
         model_name: str = MODEL_NAME,
-        tensor_parallel_size: int = 1,
         max_seq_length: int = 2048,
+        shared_model: object = None,
+        shared_tokenizer: object = None,
     ):
         """
         Initialize the skeleton extractor.
 
         Args:
             model_name: Hugging Face model name or local path
-            tensor_parallel_size: Number of GPUs for tensor parallelism
             max_seq_length: Maximum sequence length
+            shared_model: Optional shared model instance to reuse
+            shared_tokenizer: Optional shared tokenizer instance to reuse
         """
         self.model_name = model_name
-        self.tensor_parallel_size = tensor_parallel_size
         self.max_seq_length = max_seq_length
-
-        # Deferred import to avoid vLLM dependency at module load time
-        self._llm = None
-        self._sampling_params = None
-
-    def _initialize_vllm(self):
-        """Lazy initialization of vLLM engine."""
-        if self._llm is not None:
-            return
-
-        try:
-            from vllm import LLM, SamplingParams
-        except ImportError:
-            raise ImportError(
-                "vLLM is required for question skeleton extraction. "
-                "Install with: pip install vllm"
-            )
-
-        self._llm = LLM(
-            model=self.model_name,
-            tensor_parallel_size=self.tensor_parallel_size,
-            max_model_len=self.max_seq_length,
-            dtype="bfloat16",
-            enforce_eager=True,
-            trust_remote_code=True,
-            disable_log_stats=True,
-        )
-
-        self._sampling_params = SamplingParams(
-            max_tokens=256,
-            temperature=0.1,
-            top_p=0.95,
-        )
+        self._model = shared_model  # Use shared model if provided
+        self._tokenizer = shared_tokenizer  # Use shared tokenizer if provided
 
     def _format_prompt(self, question: str) -> str:
         """Format the prompt for skeleton extraction."""
@@ -159,36 +132,48 @@ class QuestionSkeletonExtractor:
         Returns:
             List of extracted question skeletons
         """
-        self._initialize_vllm()
-
-        # Update sampling params with max_new_tokens
-        from vllm import SamplingParams
-        self._sampling_params = SamplingParams(
-            max_tokens=max_new_tokens,
-            temperature=0.1,
-            top_p=0.95,
-        )
+        self._load_model()
 
         # Format all prompts
         prompts = [self._format_prompt(q) for q in questions]
 
-        # Generate in sub-batches for memory efficiency
+        # Tokenize
+        inputs = self._tokenizer(
+            prompts,
+            padding=True,
+            truncation=True,
+            max_length=self.max_seq_length,
+            return_tensors="pt",
+        ).to(self._model.device)
+
+        # Generate
         all_results = []
         total = len(prompts)
 
-        for i in range(0, total, batch_size):
-            batch_prompts = prompts[i : i + batch_size]
-            outputs = self._llm.generate(batch_prompts, self._sampling_params)
+        with torch.no_grad():
+            for i in range(0, total, batch_size):
+                batch_inputs = {
+                    k: v[i : i + batch_size] for k, v in inputs.items()
+                }
+                
+                outputs = self._model.generate(
+                    **batch_inputs,
+                    max_new_tokens=max_new_tokens,
+                    temperature=0.1,
+                    top_p=0.95,
+                    pad_token_id=self._tokenizer.pad_token_id,
+                    eos_token_id=self._tokenizer.eos_token_id,
+                )
+                
+                for output in outputs:
+                    skeleton = self._tokenizer.decode(output, skip_special_tokens=True)
+                    # Clean up the response
+                    skeleton = self._clean_response(skeleton)
+                    all_results.append(skeleton)
 
-            for output in outputs:
-                skeleton = output.outputs[0].text.strip()
-                # Clean up the response
-                skeleton = self._clean_response(skeleton)
-                all_results.append(skeleton)
-
-            if show_progress:
-                processed = min(i + batch_size, total)
-                print(f"  Processed {processed}/{total}")
+                if show_progress:
+                    processed = min(i + batch_size, total)
+                    print(f"  Processed {processed}/{total}")
 
         return all_results
 
@@ -211,17 +196,16 @@ class QuestionSkeletonExtractor:
         return response
 
     def shutdown(self):
-        """Shut down the vLLM engine and free VRAM."""
-        if self._llm is not None:
-            if hasattr(self._llm, "shutdown"):
-                self._llm.shutdown()
-            elif hasattr(self._llm, "llm_engine"):
-                self._llm.llm_engine.shutdown()
-            self._llm = None
-            self._sampling_params = None
+        """Shut down the model and free VRAM."""
+        if self._model is not None:
+            del self._model
+            self._model = None
+        if self._tokenizer is not None:
+            del self._tokenizer
+            self._tokenizer = None
 
     def __del__(self):
-        """Ensure vLLM engine is shut down on deletion."""
+        """Ensure model is shut down on deletion."""
         try:
             self.shutdown()
         except:

@@ -98,6 +98,10 @@ class SchemaLinker:
             )
             self._model.eval()
             print("Base model loaded.")
+        else:
+            print("Base model already loaded (reusing existing instance).")
+        else:
+            print("Base model already loaded (reusing existing instance).")
 
     def _load_lora(self):
         """Load the LoRA adapter into the model."""

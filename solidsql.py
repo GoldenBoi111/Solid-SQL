@@ -75,8 +75,20 @@ class SolidSQL:
         
         # Initialize skeleton components
         self.skip_skeleton_extraction = skip_skeleton_extraction
+        
+        # Create SchemaLinker first (this will load the model)
+        self.schema_linker = SchemaLinker(
+            base_model=base_model,
+            adapter_path=adapter_path,
+        )
+        
+        # Initialize question extractor with shared model
         if not skip_skeleton_extraction:
-            self.q_extractor = QuestionSkeletonExtractor()
+            self.q_extractor = QuestionSkeletonExtractor(
+                model_name=base_model,
+                shared_model=self.schema_linker._model,
+                shared_tokenizer=self.schema_linker._tokenizer,
+            )
         else:
             self.q_extractor = None
             
@@ -417,9 +429,11 @@ class SolidSQL:
         return cleaned_sql.strip()
             
     def shutdown(self):
-        """Shut down the schema linker to free resources."""
+        """Shut down the schema linker and question extractor to free resources."""
         if hasattr(self, 'schema_linker'):
             self.schema_linker.shutdown()
+        if hasattr(self, 'q_extractor') and self.q_extractor is not None:
+            self.q_extractor.shutdown()
     
     def __del__(self):
         """Ensure resources are freed on deletion."""
