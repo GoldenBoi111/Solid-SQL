@@ -116,29 +116,25 @@ class SchemaLinker:
         
         # Check if model is already a PeftModel (adapter already loaded)
         if isinstance(self._model, PeftModel):
-            # Adapter already loaded, just activate it
-            self._model.enable_adapters()
-            self._model.set_adapter("lora_adapter")
-            self._lora_active = True
-            print("LoRA adapter activated (already loaded).")
-            return
+            self._lora_loaded = True
+        else:
+            print("Loading LoRA adapter (first time)...")
+            
+            # Patch missing attribute caused by device_map="auto" + PEFT version mismatch
+            if not hasattr(self._model, 'hf_quantizer'):
+                self._model.hf_quantizer = None
+            
+            self._model = PeftModel.from_pretrained(
+                self._model,
+                str(self.adapter_path),
+                adapter_name="lora_adapter",
+            )
+            self._lora_loaded = True
+            print("LoRA adapter loaded.")
         
-        # Adapter not loaded, load it
-        print("Loading LoRA adapter...")
-        
-        # Wrap model with PeftModel and load adapter
-        self._model = PeftModel.from_pretrained(
-            self._model,
-            str(self.adapter_path),
-            adapter_name="lora_adapter",
-        )
-        
-        # Set active adapter to use LoRA
         self._model.enable_adapters()
         self._model.set_adapter("lora_adapter")
-        self._lora_loaded = True
         self._lora_active = True
-        print("LoRA adapter loaded and activated.")
 
     def _unload_lora(self):
         """Disable the LoRA adapter (keep it loaded but don't use it)."""
