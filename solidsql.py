@@ -105,12 +105,6 @@ class SolidSQL:
         # Build index if provided
         if candidate_examples and build_index:
             self.retriever.build_index(show_progress=False)
-            
-        # Single SchemaLinker instance that switches between LoRA and base model
-        self.schema_linker = SchemaLinker(
-            base_model=base_model,
-            adapter_path=adapter_path,
-        )
 
     def generate_sql(
         self,
