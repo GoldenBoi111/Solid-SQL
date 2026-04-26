@@ -208,6 +208,10 @@ class SchemaLinker:
 
         return all_results
 
+    def set_keep_alive(self, keep_alive: bool = True):
+        """Set whether to keep the LLM alive between calls."""
+        self._keep_alive = keep_alive
+
     def predict_from_db_id(
         self,
         question: str,

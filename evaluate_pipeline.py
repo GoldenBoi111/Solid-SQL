@@ -44,13 +44,13 @@ def load_schema_for_db(db_path: str) -> str:
         for table in tables:
             table_name = table[0]
             
-            # Get table info (columns)
-            cursor.execute(f"PRAGMA table_info({table_name});")
+            # Get table info (columns) - escape table name with double quotes
+            cursor.execute(f'PRAGMA table_info("{table_name}");')
             columns = cursor.fetchall()
             
             # Format columns as "name(type)"
             column_defs = [f"{col[1]}({col[2]})" for col in columns]
-            schema_lines.append(f"{table_name}({', '.join(column_defs)})")
+            schema_lines.append(f'{table_name}({", ".join(column_defs)})')
         
         conn.close()
         return "\n".join(schema_lines)
