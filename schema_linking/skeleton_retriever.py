@@ -69,6 +69,8 @@ class SkeletonRetriever:
         embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
         sql_dialect: str = "sqlite",
         faiss_index_type: str = "flat",
+        shared_model: object = None,
+        shared_tokenizer: object = None,
     ):
         """
         Initialize the retriever.
@@ -78,6 +80,8 @@ class SkeletonRetriever:
             embedding_model: Sentence transformer model for question embeddings
             sql_dialect: SQL dialect for parsing
             faiss_index_type: FAISS index type ("flat", "ivf", "hnsw")
+            shared_model: Optional shared model instance to reuse
+            shared_tokenizer: Optional shared tokenizer instance to reuse
         """
         self.candidates = candidate_examples
         self.question_skeletons = []
@@ -91,7 +95,10 @@ class SkeletonRetriever:
         self.sql_index = None
 
         # Initialize extractors and similarity calculator
-        self.q_extractor = QuestionSkeletonExtractor()
+        self.q_extractor = QuestionSkeletonExtractor(
+            shared_model=shared_model,
+            shared_tokenizer=shared_tokenizer,
+        )
         self.sql_extractor = SQLSkeletonExtractor(dialect=sql_dialect)
         self.similarity = SkeletonSimilarity(embedding_model=embedding_model)
 

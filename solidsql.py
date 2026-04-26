@@ -101,6 +101,8 @@ class SolidSQL:
             candidate_examples=candidate_examples or [],
             embedding_model=embedding_model,
             sql_dialect=sql_dialect,
+            shared_model=self.schema_linker._model,
+            shared_tokenizer=self.schema_linker._tokenizer,
         )
 
         # Build index if provided
@@ -246,6 +248,8 @@ class SolidSQL:
             candidate_examples=context_examples,
             embedding_model=self.embedding_model,
             sql_dialect=self.sql_dialect,
+            shared_model=self.schema_linker._model,
+            shared_tokenizer=self.schema_linker._tokenizer,
         )
         self.retriever.build_index(show_progress=False)
 
@@ -389,8 +393,10 @@ class SolidSQL:
     
     def _clean_sql_output(self, sql: str) -> str:
         """Clean up the SQL output from the LLM."""
-        if sql.upper().startswith('SQL:'):
-            sql = sql[4:].strip()
+        for prefix in ("SQL:", "SQLite:", "Query:", "Answer:"):
+            if sql.upper().startswith(prefix.upper()):
+                sql = sql[len(prefix):].strip()
+                break
 
         # Remove any markdown code block markers
         if sql.startswith("```sql"):
@@ -432,13 +438,6 @@ class SolidSQL:
             self.schema_linker.shutdown()
         if hasattr(self, 'q_extractor') and self.q_extractor is not None:
             self.q_extractor.shutdown()
-    
-    def __del__(self):
-        """Ensure resources are freed on deletion."""
-        try:
-            self.shutdown()
-        except:
-            pass
 
 
 # Convenience function for easy usage

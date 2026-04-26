@@ -291,6 +291,8 @@ class SchemaLinker:
 
         return all_outputs
 
+    # Warning: calling shutdown() resets _model to None, so a later
+    # predict() or generate_without_lora() call will trigger a full reload.
     def shutdown(self):
         """Shut down the model to free resources."""
         if self._model is not None:
