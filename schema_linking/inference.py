@@ -200,11 +200,8 @@ class SchemaLinker:
                 processed = min(i + batch_size, total)
                 print(f"  Processed {processed}/{total}")
 
-        # Shut down vLLM engine (unloads LoRA + frees VRAM)
-        if hasattr(llm, "shutdown"):
-            llm.shutdown()
-        elif hasattr(llm, "llm_engine"):
-            llm.llm_engine.shutdown()
+        # vLLM v0.19+ manages engine lifecycle automatically
+        # No manual shutdown needed
 
         return all_results
 
