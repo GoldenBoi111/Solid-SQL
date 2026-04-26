@@ -31,6 +31,7 @@ from typing import List, Dict, Optional
 import outlines
 import torch
 from pydantic import BaseModel
+from outlines.models import transformers as outlines_transformers
 
 from .config import (
     MODEL_NAME,
@@ -43,19 +44,9 @@ from .config import (
 from .schema_formatter import format_schema_compact, load_schemas_from_dir
 
 
-class SchemaLinkingTable(BaseModel):
-    name: str
-    reason: str
-
-
-class SchemaLinkingColumn(BaseModel):
-    name: str
-    reason: str
-
-
 class SchemaLinkingOutput(BaseModel):
-    tables: List[SchemaLinkingTable]
-    columns: List[SchemaLinkingColumn]
+    tables: List[str]
+    columns: List[str]
 
 
 class SQLOutput(BaseModel):
@@ -109,7 +100,7 @@ class SchemaLinker:
         """Load the base model and tokenizer."""
         if self._model is None:
             print("Loading base model...")
-            self._model = outlines.models.transformers(
+            self._model = outlines_transformers(
                 self.base_model_name,
                 device="cuda",
                 model_kwargs={"dtype": torch.bfloat16, "device_map": "auto"},
@@ -124,6 +115,7 @@ class SchemaLinker:
                     adapter_name="lora_adapter",
                 )
                 self._lora_loaded = True
+                self._lora_active = True
 
             self._model.model.eval()
             if self._schema_linking_generator is None:
@@ -283,6 +275,7 @@ class SchemaLinker:
         self._schema_linking_generator = None
         self._sql_generator = None
         self._lora_loaded = False
+        self._lora_active = False
 
     def predict_from_db_id(
         self,

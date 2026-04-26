@@ -89,6 +89,7 @@ class QuestionSkeletonExtractor:
         """
         self.model_name = model_name
         self.max_seq_length = max_seq_length
+        self._owns_model = False
         # Reuse the underlying transformers model when an Outlines wrapper is passed.
         if shared_model is not None and not hasattr(shared_model, "generate") and hasattr(shared_model, "model"):
             self._model = shared_model.model
@@ -115,6 +116,7 @@ class QuestionSkeletonExtractor:
                 device_map="auto",
             )
             self._model.eval()
+            self._owns_model = True
 
     def _format_prompt(self, question: str) -> str:
         """Format the prompt for skeleton extraction."""
@@ -184,6 +186,7 @@ class QuestionSkeletonExtractor:
                 outputs = self._model.generate(
                     **batch_inputs,
                     max_new_tokens=max_new_tokens,
+                    do_sample=True,
                     temperature=0.1,
                     top_p=0.95,
                     pad_token_id=self._tokenizer.pad_token_id,
@@ -222,16 +225,10 @@ class QuestionSkeletonExtractor:
 
     def shutdown(self):
         """Shut down the model and free VRAM."""
-        if self._model is not None:
+        if self._model is not None and self._owns_model:
             del self._model
             self._model = None
-        if self._tokenizer is not None:
-            del self._tokenizer
-            self._tokenizer = None
-
-    def __del__(self):
-        """Ensure model is shut down on deletion."""
-        try:
-            self.shutdown()
-        except:
-            pass
+            if self._tokenizer is not None:
+                del self._tokenizer
+                self._tokenizer = None
+        self._owns_model = False
