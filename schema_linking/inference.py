@@ -108,9 +108,8 @@ class SchemaLinker:
             self._model = PeftModel.from_pretrained(
                 self._model,
                 str(self.adapter_path),
-                adapter_name="schema_linking",
+                adapter_name="lora_adapter",
             )
-            self._model.set_adapter("schema_linking")
             self._lora_loaded = True
             print("LoRA adapter loaded.")
 
@@ -120,8 +119,8 @@ class SchemaLinker:
             print("Unloading LoRA adapter...")
             from peft import PeftModel
             
-            if hasattr(self._model, "delete_adapter"):
-                self._model.delete_adapter("schema_linking")
+            # Convert back to base model
+            self._model = self._model.merge_and_unload()
             self._lora_loaded = False
             print("LoRA adapter unloaded.")
 
