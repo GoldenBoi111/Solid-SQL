@@ -115,7 +115,7 @@ class SolidSQL:
         schema_text: str,
         top_n: int = 5,
         round_2_refinement: bool = True,
-        max_new_tokens: int = 512,
+        max_new_tokens: int = 4096,
     ) -> Dict[str, Any]:
         """
         Generate SQL using the complete SolidSQL pipeline.
@@ -236,7 +236,7 @@ class SolidSQL:
             try:
                 outputs = self.schema_linker.generate_without_lora(
                     [round_2_prompt],
-                    max_new_tokens=512,
+                    max_new_tokens=max_new_tokens,
                     show_progress=False,
                 )
                 
@@ -276,7 +276,7 @@ class SolidSQL:
         schema_text: str,
         context_examples: List[Dict[str, str]],
         top_n: int = 5,
-        max_new_tokens: int = 512,
+        max_new_tokens: int = 4096,
     ) -> Dict[str, Any]:
         """
         Generate SQL using provided context examples for retrieval.
@@ -400,7 +400,7 @@ class SolidSQL:
         question: str,
         schema_text: str,
         examples_text: str = "",
-        max_new_tokens: int = 512,
+        max_new_tokens: int = 4096,
     ) -> str:
         """
         Generate SQL using the base model without LoRA adapter.

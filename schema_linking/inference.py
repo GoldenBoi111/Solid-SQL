@@ -154,7 +154,7 @@ class SchemaLinker:
         self,
         question: str,
         schema_text: str,
-        max_new_tokens: int = 512,
+        max_new_tokens: int = 4096,
     ) -> Dict:
         """
         Generate schema linking prediction for a single question.
@@ -170,7 +170,7 @@ class SchemaLinker:
     def predict_batch(
         self,
         inputs: List[Dict[str, str]],
-        max_new_tokens: int = 512,
+        max_new_tokens: int = 4096,
         batch_size: int = 16,
         show_progress: bool = True,
     ) -> List[Dict]:
@@ -219,7 +219,7 @@ class SchemaLinker:
     def generate_without_lora(
         self,
         prompts: List[str],
-        max_new_tokens: int = 512,
+        max_new_tokens: int = 4096,
         batch_size: int = 16,
         show_progress: bool = True,
     ) -> List[str]:
@@ -279,7 +279,7 @@ class SchemaLinker:
         question: str,
         db_id: str,
         db_root: str,
-        max_new_tokens: int = 512,
+        max_new_tokens: int = 4096,
     ) -> Dict:
         """
         Load schema from db_id + db_root and predict.
