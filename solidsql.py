@@ -228,8 +228,8 @@ class SolidSQL:
                 "- Prioritize structural correctness over lexical similarity\n\n"
                 "---\n\n"
                 "## OUTPUT FORMAT\n\n"
-                "Return ONLY the final SQL query:\n\n"
-                "SELECT ...\n"
+                "Return ONLY the final SQL query.\n"
+                "The answer must be a single executable SQLite query starting with SELECT or WITH.\n"
             )
             
             # Generate SQL using the base model without LoRA adapter
@@ -443,8 +443,8 @@ class SolidSQL:
             "- joins, filters, and aggregations where needed\n\n"
             "---\n\n"
             "### OUTPUT FORMAT\n\n"
-            "Return ONLY the SQL query:\n\n"
-            "SELECT ...\n"
+            "Return ONLY the SQL query.\n"
+            "The answer must be a single executable SQLite query starting with SELECT or WITH.\n"
         ).format(question=question, schema=schema_text, examples=examples_text or "(none provided)")
         
         # Use the base model's generate_without_lora method
@@ -478,14 +478,24 @@ class SolidSQL:
         if tables:
             lines.append("Relevant Tables:")
             for table in tables:
-                lines.append(f"- {table}")
+                if isinstance(table, dict):
+                    table_name = table.get("name", "")
+                else:
+                    table_name = str(table)
+                if table_name:
+                    lines.append(f"- {table_name}")
 
         if columns:
             if lines:
                 lines.append("")
             lines.append("Relevant Columns:")
             for column in columns:
-                lines.append(f"- {column}")
+                if isinstance(column, dict):
+                    column_name = column.get("name", "")
+                else:
+                    column_name = str(column)
+                if column_name:
+                    lines.append(f"- {column_name}")
 
         return "\n".join(lines) if lines else "(no schema predicted)"
 
@@ -519,6 +529,9 @@ class SolidSQL:
     
     def _clean_sql_output(self, sql: str) -> str:
         """Clean up the SQL output from the LLM."""
+        if not sql:
+            return ""
+
         for prefix in ("SQL:", "SQLite:", "Query:", "Answer:"):
             if sql.upper().startswith(prefix.upper()):
                 sql = sql[len(prefix):].strip()
@@ -542,7 +555,7 @@ class SolidSQL:
                 cleaned_lines.append(line)
                 
         # Join lines and take only the first SQL statement if there are multiple
-        cleaned_sql = ' '.join(cleaned_lines)
+        cleaned_sql = ' '.join(cleaned_lines).strip()
         # Find the start of the SQL statement
         select_idx = cleaned_sql.upper().find("SELECT")
         with_idx = cleaned_sql.upper().find("WITH")
@@ -555,8 +568,20 @@ class SolidSQL:
         # Take only the first statement (up to semicolon)
         if ";" in cleaned_sql:
             cleaned_sql = cleaned_sql.split(";")[0] + ";"
-            
-        return cleaned_sql.strip()
+
+        cleaned_sql = cleaned_sql.strip()
+        placeholder_sql = {
+            "SELECT ...",
+            "SELECT ...;",
+            "SELECT ???",
+            "SELECT ???;",
+            "WITH ...",
+            "WITH ...;",
+        }
+        if cleaned_sql.upper() in {item.upper() for item in placeholder_sql}:
+            return ""
+
+        return cleaned_sql
             
     def shutdown(self):
         """Shut down the schema linker and question extractor to free resources."""

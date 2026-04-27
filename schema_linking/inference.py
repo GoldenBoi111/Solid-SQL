@@ -45,12 +45,12 @@ from .schema_formatter import format_schema_compact, load_schemas_from_dir
 
 
 class SchemaLinkingOutput(BaseModel):
-    tables: List[str]
-    columns: List[str]
+    class SchemaItem(BaseModel):
+        name: str
+        reason: str
 
-
-class SQLOutput(BaseModel):
-    sql: str
+    tables: List[SchemaItem]
+    columns: List[SchemaItem]
 
 
 class SchemaLinker:
@@ -223,18 +223,7 @@ class SchemaLinker:
         batch_size: int = 16,
         show_progress: bool = True,
     ) -> List[str]:
-        """
-        Generate text using the base model WITHOUT LoRA adapter.
-
-        Args:
-            prompts: List of prompt strings to generate from
-            max_new_tokens: Maximum tokens to generate
-            batch_size: Batch size for generation
-            show_progress: Whether to show progress
-
-        Returns:
-            List of generated text strings
-        """
+        """Generate raw text using the base model without the LoRA adapter."""
         # Load base model (without LoRA)
         self._load_model()
 
@@ -244,16 +233,36 @@ class SchemaLinker:
 
         all_outputs = []
         total = len(prompts)
+        model = self._model.model
+        device = next(model.parameters()).device
 
         for i in range(0, total, batch_size):
             batch_prompts = prompts[i : i + batch_size]
-            for prompt in batch_prompts:
-                output = self._model(
-                    prompt,
-                    output_type=SQLOutput,
+            inputs = self._tokenizer(
+                batch_prompts,
+                padding=True,
+                truncation=True,
+                max_length=self.max_seq_length,
+                return_tensors="pt",
+            ).to(device)
+
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
                     max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    pad_token_id=self._tokenizer.pad_token_id,
+                    eos_token_id=self._tokenizer.eos_token_id,
                 )
-                all_outputs.append(SQLOutput.model_validate_json(output).sql)
+
+            prompt_lengths = inputs["attention_mask"].sum(dim=1).tolist()
+            for output, prompt_length in zip(outputs, prompt_lengths):
+                generated_tokens = output[int(prompt_length):]
+                text = self._tokenizer.decode(
+                    generated_tokens,
+                    skip_special_tokens=True,
+                ).strip()
+                all_outputs.append(text)
 
             if show_progress:
                 processed = min(i + batch_size, total)

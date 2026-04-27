@@ -177,7 +177,9 @@ class QuestionSkeletonExtractor:
             truncation=True,
             max_length=self.max_seq_length,
             return_tensors="pt",
-        ).to(next(self._model.model.parameters()).device)
+        )
+        model = self._model.model if hasattr(self._model, "model") else self._model
+        inputs = inputs.to(next(model.parameters()).device)
 
         # Generate
         all_results = []
@@ -189,7 +191,7 @@ class QuestionSkeletonExtractor:
                     k: v[i : i + batch_size] for k, v in inputs.items()
                 }
                 
-                outputs = self._model.generate(
+                outputs = model.generate(
                     **batch_inputs,
                     max_new_tokens=max_new_tokens,
                     do_sample=True,
@@ -199,8 +201,10 @@ class QuestionSkeletonExtractor:
                     eos_token_id=self._tokenizer.eos_token_id,
                 )
                 
-                for output in outputs:
-                    skeleton = self._tokenizer.decode(output, skip_special_tokens=True)
+                batch_attention = batch_inputs["attention_mask"].sum(dim=1).tolist()
+                for output, prompt_length in zip(outputs, batch_attention):
+                    generated_tokens = output[int(prompt_length):]
+                    skeleton = self._tokenizer.decode(generated_tokens, skip_special_tokens=True)
                     # Clean up the response
                     skeleton = self._clean_response(skeleton)
                     all_results.append(skeleton)
