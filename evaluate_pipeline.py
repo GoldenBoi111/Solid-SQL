@@ -22,6 +22,19 @@ from typing import Dict, List, Tuple
 from solidsql import SolidSQL
 
 
+def summarize_text(text: str, limit: int = 240) -> str:
+    """Return a compact single-line preview for logging."""
+    cleaned = " ".join(text.split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 3] + "..."
+
+
+def summarize_sql(sql: str, limit: int = 180) -> str:
+    """Return a compact SQL preview for logging."""
+    return summarize_text(sql, limit=limit)
+
+
 def load_schema_for_db(db_path: str) -> str:
     """
     Load schema for a SQLite database.
@@ -149,7 +162,10 @@ def evaluate_questions(
         db_id = item["db_id"]
         ground_truth_sql = item.get("SQL", item.get("sql", ""))
         
-        print(f"Processing question {i+1}/{len(questions_data)}: {question_id}")
+        print("\n" + "-" * 80)
+        print(f"[Question {i+1}/{len(questions_data)}] ID: {question_id}")
+        print(f"Question: {question}")
+        print(f"Database: {db_id}")
         
         # Find database file
         db_path = os.path.join(databases_dir, db_id, f"{db_id}.sqlite")
@@ -157,34 +173,47 @@ def evaluate_questions(
             # Try alternative naming
             db_path = os.path.join(databases_dir, f"{db_id}.sqlite")
             if not os.path.exists(db_path):
-                print(f"Warning: Database not found for {db_id}")
+                print(f"[Database Lookup] Missing database file for {db_id}")
                 continue
         
         # Load schema from cache or database
+        print("[Stage 1: Schema Load] Loading schema text...")
         if db_id not in db_cache:
             schema_text = load_schema_for_db(db_path)
             if not schema_text:
-                print(f"Warning: Could not load schema for {db_id}")
+                print(f"[Stage 1: Schema Load] Failed for {db_id}")
                 continue
             db_cache[db_id] = {
                 "schema": schema_text,
                 "path": db_path
             }
+            print("[Stage 1: Schema Load] Loaded from SQLite and cached.")
         else:
             schema_text = db_cache[db_id]["schema"]
+            print("[Stage 1: Schema Load] Reused cached schema.")
+        print(f"[Stage 1: Schema Load] Schema preview: {summarize_text(schema_text)}")
         
         # Track statistics
         db_stats[db_id]["total"] += 1
         start_time = time.time()
         
         try:
-            # Generate SQL
+            print("[Stage 2: Generation] Running SolidSQL pipeline...")
             result = solidsql.generate_sql(
                 question=question,
                 schema_text=schema_text,
                 top_n=3,
                 round_2_refinement=True
             )
+            print("[Stage 2: Generation] Pipeline output received.")
+            print(f"[Stage 2: Generation] Predicted schema: {summarize_text(result.get('generated_schema', ''))}")
+            print(f"[Stage 2: Generation] Question skeleton: {summarize_text(result.get('question_skeleton', ''))}")
+            print(f"[Stage 2: Generation] Retrieved examples: {len(result.get('retrieval_results', []))}")
+            print(f"[Stage 2: Generation] Round 1 SQL: {summarize_sql(result.get('round_1_sql', ''))}")
+            if result.get("refined_sql"):
+                print(f"[Stage 2: Generation] Refined SQL: {summarize_sql(result.get('refined_sql', ''))}")
+            else:
+                print("[Stage 2: Generation] Refined SQL: (not produced)")
             
             # Use the refined SQL if available, otherwise fall back to round 1 SQL
             if result.get("refined_sql"):
@@ -194,17 +223,25 @@ def evaluate_questions(
             execution_time = time.time() - start_time
             db_stats[db_id]["total_time"] += execution_time
             
-            # Execute both SQL queries
+            print("[Stage 3: Execution] Running generated SQL against SQLite...")
             generated_results = execute_sql_and_fetch_results(db_path, generated_sql)
+            print(f"[Stage 3: Execution] Generated SQL rows: {len(generated_results)}")
+            print(f"[Stage 3: Execution] Generated SQL preview: {summarize_sql(generated_sql)}")
+            print("[Stage 3: Execution] Running ground-truth SQL against SQLite...")
             ground_truth_results = execute_sql_and_fetch_results(db_path, ground_truth_sql)
+            print(f"[Stage 3: Execution] Ground-truth rows: {len(ground_truth_results)}")
+            print(f"[Stage 3: Execution] Ground-truth SQL preview: {summarize_sql(ground_truth_sql)}")
             
             db_stats[db_id]["executed"] += 1
             
-            # Execution accuracy: check if both queries produce same results
+            print("[Stage 4: Comparison] Comparing execution results...")
             is_correct = compare_results(generated_results, ground_truth_results)
                 
             if is_correct:
                 db_stats[db_id]["correct"] += 1
+                print("[Stage 4: Comparison] Result: MATCH")
+            else:
+                print("[Stage 4: Comparison] Result: MISMATCH")
             
             results.append({
                 "question_id": question_id,
@@ -218,6 +255,8 @@ def evaluate_questions(
                 "execution_time": execution_time,
                 "retrieved_examples": len(result["retrieval_results"])
             })
+            print(f"[Stage 5: Outcome] Final status: {'correct' if is_correct else 'incorrect'}")
+            print(f"[Stage 5: Outcome] Execution time: {execution_time:.4f}s")
             
         except Exception as e:
             execution_time = time.time() - start_time
@@ -235,7 +274,8 @@ def evaluate_questions(
                 "is_correct": False
             })
             
-            print(f"Error processing question {question_id}: {e}")
+            print(f"[Stage 5: Outcome] Error processing question {question_id}: {e}")
+            print(f"[Stage 5: Outcome] Execution time before failure: {execution_time:.4f}s")
     
     # Compute final statistics
     overall_stats = {
@@ -330,38 +370,40 @@ def main():
         return
     
     # Load questions
-    print(f"Loading questions from {args.questions}...")
+    print(f"[Setup] Loading questions from {args.questions}...")
     with open(args.questions, "r", encoding="utf-8") as f:
         questions_data = json.load(f)
     
     # Initialize SolidSQL with skeleton extraction skipped
-    print("Initializing SolidSQL system...")
+    print("[Setup] Initializing SolidSQL system...")
     solidsql = SolidSQL(
         candidate_examples=[],  # Empty since we'll load from indices
         adapter_path=args.adapter,
         build_index=False,  # Don't build new index
         skip_skeleton_extraction=True  # Skip question skeleton extraction for evaluation
     )
+    print("[Setup] SolidSQL ready.")
     
     # Load pre-built FAISS indices
-    print(f"Loading FAISS indices from {args.metadata_index}...")
+    print(f"[Setup] Loading FAISS indices from {args.metadata_index}...")
     solidsql.load_retrieval_index(
         args.metadata_index,
         question_index_path=args.question_index,
         sql_index_path=args.sql_index
     )
+    print("[Setup] FAISS indices loaded.")
     
     # Evaluate questions
-    print("Starting evaluation...")
+    print("[Run] Starting evaluation...")
     stats = evaluate_questions(questions_data, args.databases, solidsql, args.output)
     
     # Print summary
     print_summary(stats)
     
-    print(f"\nDetailed results saved to: {args.output}")
+    print(f"\n[Run] Detailed results saved to: {args.output}")
     
     # Clean up resources
-    print("Cleaning up resources...")
+    print("[Cleanup] Releasing resources...")
     solidsql.shutdown()
 
 
