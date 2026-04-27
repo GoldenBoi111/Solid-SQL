@@ -295,12 +295,6 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    schema_text = args.schema_text
-    if not schema_text and args.schema_file:
-        schema_text = Path(args.schema_file).read_text(encoding="utf-8")
-    if not schema_text:
-        raise ValueError("Provide either --schema-text or --schema-file")
-
     linker = LoRASchemaLinker(
         base_model=args.base_model,
         adapter_path=args.adapter,
