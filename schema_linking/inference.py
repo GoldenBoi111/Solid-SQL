@@ -64,6 +64,27 @@ def _resolve_generation_model(model: object) -> object:
     raise AttributeError(f"Could not find a generate() method on model type {type(model).__name__}")
 
 
+def _resolve_parameter_model(model: object) -> object:
+    """Return the first nested model object that exposes `parameters()`."""
+    current = model
+    seen = set()
+
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if hasattr(current, "parameters"):
+            return current
+
+        for attr in ("model", "language_model", "base_model", "module"):
+            nested = getattr(current, attr, None)
+            if nested is not None and id(nested) not in seen:
+                current = nested
+                break
+        else:
+            current = None
+
+    raise AttributeError(f"Could not find a parameters() method on model type {type(model).__name__}")
+
+
 def _clean_generated_text(text: str) -> str:
     """Normalize generated text and strip markdown fences."""
     text = (text or "").strip()
@@ -298,7 +319,8 @@ class SchemaLinker:
         ]
 
         model = _resolve_generation_model(self._model)
-        device = next(model.parameters()).device
+        parameter_model = _resolve_parameter_model(self._model)
+        device = next(parameter_model.parameters()).device
         all_results = []
         total = len(prompts)
 
@@ -357,7 +379,8 @@ class SchemaLinker:
         all_outputs = []
         total = len(prompts)
         model = _resolve_generation_model(self._model)
-        device = next(model.parameters()).device
+        parameter_model = _resolve_parameter_model(self._model)
+        device = next(parameter_model.parameters()).device
 
         for i in range(0, total, batch_size):
             batch_prompts = prompts[i : i + batch_size]

@@ -30,7 +30,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import MODEL_NAME
-from .inference import _resolve_generation_model
+from .inference import _resolve_generation_model, _resolve_parameter_model
 
 
 # Prompt template for extracting question skeleton
@@ -180,7 +180,8 @@ class QuestionSkeletonExtractor:
             return_tensors="pt",
         )
         model = _resolve_generation_model(self._model)
-        inputs = inputs.to(next(model.parameters()).device)
+        parameter_model = _resolve_parameter_model(self._model)
+        inputs = inputs.to(next(parameter_model.parameters()).device)
 
         # Generate
         all_results = []
