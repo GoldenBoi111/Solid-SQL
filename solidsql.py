@@ -136,11 +136,13 @@ class SolidSQL:
             schema_text=schema_text,
             max_new_tokens=max_new_tokens,
         )
+        generated_schema_text = self._format_generated_schema(schema_result)
         
         # Generate SQL in round 1 using the base model without LoRA adapter
         round_1_sql = self._generate_sql_with_base_model(
             question=question,
-            schema_text=schema_text,
+            schema_text=generated_schema_text,
+            examples_text=self._format_few_shot_examples(self.retriever.candidates),
             max_new_tokens=max_new_tokens,
         )
 
@@ -166,23 +168,68 @@ class SolidSQL:
         refined_sql = None
 
         if round_2_refinement and retrieval_results:
-            # Get the most similar examples
-            examples_context = []
-            for result in retrieval_results[:3]:  # Use top 3 examples
-                example = result["example"]
-                examples_context.append(f"Question: {example['question']}\nSQL: {example['sql']}")
-            
-            examples_text = "\n\n".join(examples_context)
+            structural_results = self.retriever.retrieve_by_sql(
+                round_1_sql,
+                top_n=top_n,
+                show_progress=False,
+            )
+            structural_examples = self._format_structural_examples(structural_results[:3])
+            draft_sql_skeleton = self.sql_extractor.extract(round_1_sql)
             
             # Create prompt for round 2 SQL generation
             round_2_prompt = (
-                "Given a natural language question, database schema, examples of similar questions with their SQL queries, "
-                "and a preliminary SQL query, generate a refined SQL query to answer the question.\n\n"
-                f"Examples:\n{examples_text}\n\n"
-                f"Question: {question}\n\n"
-                f"Database Schema:\n{schema_text}\n\n"
-                f"Preliminary SQL:\n{round_1_sql}\n\n"
-                "Generate the refined SQL query:\n"
+                "You are a structure-aware text-to-SQL system.\n\n"
+                "Your task is to generate the FINAL SQL query using:\n"
+                "1. The database schema\n"
+                "2. The user question\n"
+                "3. The Round 1 draft SQL\n"
+                "4. SQL examples selected based on structural similarity (SQL skeleton matching)\n\n"
+                "---\n\n"
+                "## IMPORTANT PRINCIPLE\n\n"
+                "Unlike Round 1, which relies on semantic and example-based generation,\n"
+                "Round 2 prioritizes STRUCTURAL similarity of SQL programs.\n\n"
+                "You must:\n"
+                "- Use the structure of the Round 1 SQL (not just the question)\n"
+                "- Focus on SQL skeleton similarity (joins, filters, aggregations)\n"
+                "- Ensure schema correctness and logical consistency\n\n"
+                "---\n\n"
+                "## DATABASE SCHEMA\n"
+                f"{generated_schema_text}\n\n"
+                "---\n\n"
+                "## USER QUESTION\n"
+                f"{question}\n\n"
+                "---\n\n"
+                "## ROUND 1 DRAFT SQL\n"
+                f"{round_1_sql}\n\n"
+                "---\n\n"
+                "## SQL SKELETON OF ROUND 1 SQL\n"
+                f"{draft_sql_skeleton}\n\n"
+                "---\n\n"
+                "## STRUCTURALLY SIMILAR SQL EXAMPLES\n"
+                "These examples were retrieved using SQL skeleton edit distance (not text similarity):\n\n"
+                f"{structural_examples}\n\n"
+                "---\n\n"
+                "## TASK\n\n"
+                "Step 1:\n"
+                "Analyze the Round 1 SQL skeleton to understand the intended query structure.\n\n"
+                "Step 2:\n"
+                "Use the structurally similar SQL examples to refine understanding of:\n"
+                "- correct join patterns\n"
+                "- correct filtering conditions\n"
+                "- correct aggregation logic\n"
+                "- correct schema usage\n\n"
+                "Step 3:\n"
+                "Generate the FINAL SQL query that best answers the user question.\n\n"
+                "---\n\n"
+                "## RULES\n"
+                "- Do NOT output explanations\n"
+                "- Do NOT output multiple SQL queries\n"
+                "- Use correct schema names exactly\n"
+                "- Prioritize structural correctness over lexical similarity\n\n"
+                "---\n\n"
+                "## OUTPUT FORMAT\n\n"
+                "Return ONLY the final SQL query:\n\n"
+                "SELECT ...\n"
             )
             
             # Generate SQL using the base model without LoRA adapter
@@ -207,6 +254,7 @@ class SolidSQL:
         result = {
             "question": question,
             "schema": schema_text,
+            "generated_schema": generated_schema_text,
             "schema_linking_result": schema_result,
             "question_skeleton": question_skeleton,
             "retrieval_results": retrieval_results,
@@ -347,7 +395,13 @@ class SolidSQL:
         
         return response
             
-    def _generate_sql_with_base_model(self, question: str, schema_text: str, max_new_tokens: int = 512) -> str:
+    def _generate_sql_with_base_model(
+        self,
+        question: str,
+        schema_text: str,
+        examples_text: str = "",
+        max_new_tokens: int = 512,
+    ) -> str:
         """
         Generate SQL using the base model without LoRA adapter.
         
@@ -361,16 +415,37 @@ class SolidSQL:
         """
         # SQL generation prompt
         sql_prompt = (
-            "Given a natural language question and a database schema, "
-            "generate a SQL query to answer the question.\n\n"
-            "Rules:\n"
-            "- Use only tables and columns from the provided schema\n"
-            "- Generate valid SQL that answers the question\n"
-            "- Do NOT include any text outside of the SQL query\n\n"
-            "Question:\n{question}\n\n"
-            "Database Schema:\n{schema_text}\n\n"
-            "SQL:\n"
-        ).format(question=question, schema_text=schema_text)
+            "You are a text-to-SQL generation model.\n\n"
+            "Your task is to generate a SQL query based on:\n"
+            "- the user question\n"
+            "- the database schema\n"
+            "- a set of example question-SQL pairs (few-shot demonstrations)\n\n"
+            "IMPORTANT:\n"
+            "- The SQL you generate is a DRAFT (Round 1 output)\n"
+            "- It will be used for further refinement later\n"
+            "- Do NOT try to be perfect; focus on following schema and example patterns\n"
+            "- Do NOT output explanations\n\n"
+            "---\n\n"
+            "### DATABASE SCHEMA\n"
+            "{schema}\n\n"
+            "---\n\n"
+            "### USER QUESTION\n"
+            "{question}\n\n"
+            "---\n\n"
+            "### FEW-SHOT EXAMPLES\n"
+            "{examples}\n\n"
+            "---\n\n"
+            "### TASK\n\n"
+            "Study the schema and examples carefully, then generate a SQL query that best answers the user question.\n\n"
+            "Pay attention to:\n"
+            "- correct table and column usage\n"
+            "- similar query patterns from examples\n"
+            "- joins, filters, and aggregations where needed\n\n"
+            "---\n\n"
+            "### OUTPUT FORMAT\n\n"
+            "Return ONLY the SQL query:\n\n"
+            "SELECT ...\n"
+        ).format(question=question, schema=schema_text, examples=examples_text or "(none provided)")
         
         # Use the base model's generate_without_lora method
         try:
@@ -390,6 +465,57 @@ class SolidSQL:
             sql = ""
         
         return sql
+
+    def _format_generated_schema(self, schema_result: Dict[str, Any]) -> str:
+        """Format the LoRA schema-linking output into a compact schema summary."""
+        if not schema_result:
+            return "(no schema predicted)"
+
+        tables = schema_result.get("tables", [])
+        columns = schema_result.get("columns", [])
+
+        lines = []
+        if tables:
+            lines.append("Relevant Tables:")
+            for table in tables:
+                lines.append(f"- {table}")
+
+        if columns:
+            if lines:
+                lines.append("")
+            lines.append("Relevant Columns:")
+            for column in columns:
+                lines.append(f"- {column}")
+
+        return "\n".join(lines) if lines else "(no schema predicted)"
+
+    def _format_few_shot_examples(self, candidates: List[Dict[str, str]], limit: int = 3) -> str:
+        """Format a small few-shot block from candidate examples."""
+        if not candidates:
+            return "(none provided)"
+
+        selected_examples = candidates[:limit]
+        formatted_examples = []
+        for example in selected_examples:
+            formatted_examples.append(
+                f"Question: {example['question']}\nSQL: {example['sql']}"
+            )
+        return "\n\n".join(formatted_examples)
+
+    def _format_structural_examples(self, results: List[Dict[str, Any]]) -> str:
+        """Format structurally similar SQL retrieval results for the round-2 prompt."""
+        if not results:
+            return "(none provided)"
+
+        formatted_examples = []
+        for result in results:
+            example = result["example"]
+            formatted_examples.append(
+                f"Question: {example['question']}\n"
+                f"SQL: {example['sql']}\n"
+                f"SQL Skeleton: {result['candidate_sql_skeleton']}"
+            )
+        return "\n\n".join(formatted_examples)
     
     def _clean_sql_output(self, sql: str) -> str:
         """Clean up the SQL output from the LLM."""
