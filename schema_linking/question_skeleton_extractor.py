@@ -90,12 +90,18 @@ class QuestionSkeletonExtractor:
         self.model_name = model_name
         self.max_seq_length = max_seq_length
         self._owns_model = False
-        # Reuse the underlying transformers model when an Outlines wrapper is passed.
-        if shared_model is not None and not hasattr(shared_model, "generate") and hasattr(shared_model, "model"):
-            self._model = shared_model.model
+        if shared_model is not None:
+            if hasattr(shared_model, "model"):
+                self._model = shared_model.model  # unwrap Outlines wrapper
+            else:
+                self._model = shared_model
         else:
-            self._model = shared_model
-        self._tokenizer = shared_tokenizer  # Use shared tokenizer if provided
+            self._model = None
+
+        if shared_tokenizer is not None and hasattr(shared_tokenizer, "tokenizer"):
+            self._tokenizer = shared_tokenizer.tokenizer
+        else:
+            self._tokenizer = shared_tokenizer
 
     def _load_model(self):
         """Load the base model and tokenizer if not already loaded."""
