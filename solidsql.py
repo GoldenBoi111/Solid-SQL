@@ -473,6 +473,13 @@ class SolidSQL:
 
         tables = schema_result.get("tables", [])
         columns = schema_result.get("columns", [])
+        join_relationships = schema_result.get("join_relationships", [])
+        filters_constraints = schema_result.get("filters_constraints", [])
+        question_intent = schema_result.get("question_intent", "")
+        raw_output = schema_result.get("raw_output", "")
+
+        if raw_output:
+            return raw_output
 
         lines = []
         if tables:
@@ -489,13 +496,38 @@ class SolidSQL:
             if lines:
                 lines.append("")
             lines.append("Relevant Columns:")
-            for column in columns:
-                if isinstance(column, dict):
-                    column_name = column.get("name", "")
-                else:
-                    column_name = str(column)
-                if column_name:
-                    lines.append(f"- {column_name}")
+            if isinstance(columns, dict):
+                for table_name, table_columns in columns.items():
+                    if table_columns:
+                        lines.append(f"- {table_name}: {', '.join(table_columns)}")
+            else:
+                for column in columns:
+                    if isinstance(column, dict):
+                        column_name = column.get("name", "")
+                    else:
+                        column_name = str(column)
+                    if column_name:
+                        lines.append(f"- {column_name}")
+
+        if join_relationships:
+            if lines:
+                lines.append("")
+            lines.append("Join Relationships:")
+            for relationship in join_relationships:
+                lines.append(f"- {relationship}")
+
+        if filters_constraints:
+            if lines:
+                lines.append("")
+            lines.append("Filters / Constraints:")
+            for item in filters_constraints:
+                lines.append(f"- {item}")
+
+        if question_intent:
+            if lines:
+                lines.append("")
+            lines.append("Question Intent:")
+            lines.append(f"- {question_intent}")
 
         return "\n".join(lines) if lines else "(no schema predicted)"
 

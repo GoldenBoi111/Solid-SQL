@@ -27,10 +27,10 @@ Usage:
 
 from pathlib import Path
 from typing import List, Dict, Optional
+import re
 
 import outlines
 import torch
-from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import (
@@ -38,19 +38,125 @@ from .config import (
     OUTPUT_DIR,
     MAX_SEQ_LENGTH,
     INSTRUCTION_TEMPLATE,
-    OUTPUT_SCHEMA,
     LORA_R,
 )
 from .schema_formatter import format_schema_compact, load_schemas_from_dir
 
 
-class SchemaLinkingOutput(BaseModel):
-    class SchemaItem(BaseModel):
-        name: str
-        reason: str
+def _resolve_generation_model(model: object) -> object:
+    """Return the first nested model object that exposes `generate()`."""
+    current = model
+    seen = set()
 
-    tables: List[SchemaItem]
-    columns: List[SchemaItem]
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if hasattr(current, "generate"):
+            return current
+
+        for attr in ("model", "language_model", "base_model", "module"):
+            nested = getattr(current, attr, None)
+            if nested is not None and id(nested) not in seen:
+                current = nested
+                break
+        else:
+            current = None
+
+    raise AttributeError(f"Could not find a generate() method on model type {type(model).__name__}")
+
+
+def _clean_generated_text(text: str) -> str:
+    """Normalize generated text and strip markdown fences."""
+    text = (text or "").strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines:
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    return text
+
+
+def _extract_section_lines(text: str, heading: str) -> List[str]:
+    """Extract bullet/content lines that belong to a named section."""
+    lines = text.splitlines()
+    collected = []
+    in_section = False
+    target = heading.lower()
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            if in_section and collected:
+                continue
+            continue
+
+        if line.endswith(":"):
+            if line[:-1].strip().lower() == target:
+                in_section = True
+                collected = []
+                continue
+            if in_section:
+                break
+
+        if in_section:
+            collected.append(line)
+
+    return collected
+
+
+def _parse_schema_linking_response(text: str) -> Dict[str, object]:
+    """Parse the schema-linking note into structured fields."""
+    cleaned = _clean_generated_text(text)
+
+    tables = []
+    for line in _extract_section_lines(cleaned, "Relevant Tables"):
+        item = line[1:].strip() if line.startswith("-") else line
+        if item:
+            tables.append(item)
+
+    columns = {}
+    for line in _extract_section_lines(cleaned, "Relevant Columns"):
+        item = line[1:].strip() if line.startswith("-") else line
+        if not item or ":" not in item:
+            continue
+        table_name, raw_columns = item.split(":", 1)
+        column_names = [
+            col.strip()
+            for col in re.split(r",\s*", raw_columns.strip())
+            if col.strip()
+        ]
+        if table_name.strip() and column_names:
+            columns[table_name.strip()] = column_names
+
+    join_relationships = []
+    for line in _extract_section_lines(cleaned, "Join Relationships"):
+        item = line[1:].strip() if line.startswith("-") else line
+        if item:
+            join_relationships.append(item)
+
+    filters_constraints = []
+    for line in _extract_section_lines(cleaned, "Filters / Constraints"):
+        item = line[1:].strip() if line.startswith("-") else line
+        if item:
+            filters_constraints.append(item)
+
+    question_intent_lines = _extract_section_lines(cleaned, "Question Intent")
+    question_intent = ""
+    for line in question_intent_lines:
+        item = line[1:].strip() if line.startswith("-") else line
+        if item:
+            question_intent = item
+            break
+
+    return {
+        "tables": tables,
+        "columns": columns,
+        "join_relationships": join_relationships,
+        "filters_constraints": filters_constraints,
+        "question_intent": question_intent,
+        "raw_output": cleaned,
+    }
 
 
 class SchemaLinker:
@@ -191,21 +297,38 @@ class SchemaLinker:
             for item in inputs
         ]
 
-        # Tokenize
+        model = _resolve_generation_model(self._model)
+        device = next(model.parameters()).device
         all_results = []
         total = len(prompts)
 
         for i in range(0, total, batch_size):
             batch_prompts = prompts[i : i + batch_size]
-            for prompt in batch_prompts:
-                output = self._model(
-                    prompt,
-                    output_type=SchemaLinkingOutput,
+            tokenized = self._tokenizer(
+                batch_prompts,
+                padding=True,
+                truncation=True,
+                max_length=self.max_seq_length,
+                return_tensors="pt",
+            ).to(device)
+
+            with torch.no_grad():
+                outputs = model.generate(
+                    **tokenized,
                     max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    pad_token_id=self._tokenizer.pad_token_id,
+                    eos_token_id=self._tokenizer.eos_token_id,
                 )
-                all_results.append(
-                    SchemaLinkingOutput.model_validate_json(output).model_dump()
-                )
+
+            prompt_lengths = tokenized["attention_mask"].sum(dim=1).tolist()
+            for output, prompt_length in zip(outputs, prompt_lengths):
+                generated_tokens = output[int(prompt_length):]
+                text = self._tokenizer.decode(
+                    generated_tokens,
+                    skip_special_tokens=True,
+                ).strip()
+                all_results.append(_parse_schema_linking_response(text))
 
             if show_progress:
                 processed = min(i + batch_size, total)
@@ -233,7 +356,7 @@ class SchemaLinker:
 
         all_outputs = []
         total = len(prompts)
-        model = self._model.model
+        model = _resolve_generation_model(self._model)
         device = next(model.parameters()).device
 
         for i in range(0, total, batch_size):
