@@ -44,24 +44,33 @@ from .schema_formatter import format_schema_compact, load_schemas_from_dir
 
 
 def _resolve_generation_model(model: object) -> object:
-    """Return the first nested model object that exposes `generate()`."""
-    current = model
+    """Return the deepest nested model object suitable for HF-style `generate()`."""
+    stack = [model]
     seen = set()
+    best_candidate = None
 
-    while current is not None and id(current) not in seen:
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
         seen.add(id(current))
-        if hasattr(current, "generate"):
-            return current
+
+        has_generate = hasattr(current, "generate")
+        has_parameters = hasattr(current, "parameters")
+        if has_generate and has_parameters:
+            best_candidate = current
 
         for attr in ("model", "language_model", "base_model", "module"):
             nested = getattr(current, attr, None)
             if nested is not None and id(nested) not in seen:
-                current = nested
-                break
-        else:
-            current = None
+                stack.append(nested)
 
-    raise AttributeError(f"Could not find a generate() method on model type {type(model).__name__}")
+    if best_candidate is not None:
+        return best_candidate
+
+    raise AttributeError(
+        f"Could not find a model with both generate() and parameters() on type {type(model).__name__}"
+    )
 
 
 def _resolve_parameter_model(model: object) -> object:
