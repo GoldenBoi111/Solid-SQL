@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing as mp
 import os
 import sqlite3
+import tempfile
 import time
 import traceback
 from collections import defaultdict
@@ -409,8 +411,9 @@ class BaseModelSQLPipeline:
         candidate_examples: Optional[List[Dict[str, str]]] = None,
         embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
         sql_dialect: str = "sqlite",
-        round_1_max_new_tokens: int = 4096,
-        round_2_max_new_tokens: int = 4096,
+        round_1_max_new_tokens: int = 512,
+        round_2_max_new_tokens: int = 512,
+        gpu_id: Optional[int] = None,
     ) -> None:
         self.base_model_name = base_model
         self.candidate_examples = candidate_examples or []
@@ -419,6 +422,7 @@ class BaseModelSQLPipeline:
         self.max_seq_length = 2048
         self.round_1_max_new_tokens = round_1_max_new_tokens
         self.round_2_max_new_tokens = round_2_max_new_tokens
+        self.gpu_id = gpu_id
         self._model = None
         self._tokenizer = None
         self.sql_extractor = SQLSkeletonExtractor(dialect=sql_dialect)
@@ -434,11 +438,17 @@ class BaseModelSQLPipeline:
         if self._model is not None:
             return
 
+        if self.gpu_id is not None and torch.cuda.is_available():
+            torch.cuda.set_device(self.gpu_id)
+            device_map: Any = {"": self.gpu_id}
+        else:
+            device_map = "auto"
+
         self._model = AutoModelForCausalLM.from_pretrained(
             self.base_model_name,
             trust_remote_code=True,
             dtype=torch.bfloat16,
-            device_map="auto",
+            device_map=device_map,
         )
         self._tokenizer = AutoTokenizer.from_pretrained(
             self.base_model_name,
@@ -961,6 +971,133 @@ def print_summary(stats: Dict[str, Any]) -> None:
         print(f"    Average time: {db_stats['average_execution_time']:.4f}s")
 
 
+def split_questions_into_shards(
+    questions_data: List[Dict[str, Any]],
+    num_shards: int,
+) -> List[List[Dict[str, Any]]]:
+    shards: List[List[Dict[str, Any]]] = [[] for _ in range(num_shards)]
+    for index, item in enumerate(questions_data):
+        shards[index % num_shards].append(item)
+    return [shard for shard in shards if shard]
+
+
+def merge_shard_outputs(
+    shard_outputs: List[Dict[str, Any]],
+    original_questions: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    merged_results: List[Dict[str, Any]] = []
+    merged_db_stats = defaultdict(
+        lambda: {
+            "total": 0,
+            "correct": 0,
+            "exact_match": 0,
+            "parsed": 0,
+            "executed": 0,
+            "errors": 0,
+            "total_time": 0.0,
+        }
+    )
+
+    for shard_output in shard_outputs:
+        merged_results.extend(shard_output.get("detailed_results", []))
+        for db_id, stats in shard_output.get("per_database_statistics", {}).items():
+            target = merged_db_stats[db_id]
+            target["total"] += stats.get("total", 0)
+            target["correct"] += stats.get("correct", 0)
+            target["exact_match"] += stats.get("exact_match", 0)
+            target["parsed"] += stats.get("parsed", 0)
+            target["executed"] += stats.get("executed", 0)
+            target["errors"] += stats.get("errors", 0)
+            target["total_time"] += stats.get("total_time", 0.0)
+
+    order = {str(item.get("question_id", index)): index for index, item in enumerate(original_questions)}
+    merged_results.sort(key=lambda item: order.get(str(item.get("question_id")), 10**9))
+
+    overall_stats = {
+        "total_questions": len(original_questions),
+        "processed_questions": sum(stats["total"] for stats in merged_db_stats.values()),
+        "correct_answers": sum(stats["correct"] for stats in merged_db_stats.values()),
+        "exact_matches": sum(stats["exact_match"] for stats in merged_db_stats.values()),
+        "executed_queries": sum(stats["executed"] for stats in merged_db_stats.values()),
+        "parsed_queries": sum(stats["parsed"] for stats in merged_db_stats.values()),
+        "errors": sum(stats["errors"] for stats in merged_db_stats.values()),
+        "average_execution_time": (
+            sum(stats["total_time"] for stats in merged_db_stats.values())
+            / max(sum(stats["total"] for stats in merged_db_stats.values()), 1)
+        ),
+    }
+    overall_stats["execution_accuracy"] = (
+        overall_stats["correct_answers"] / max(overall_stats["executed_queries"], 1)
+    )
+    overall_stats["exact_match_accuracy"] = (
+        overall_stats["exact_matches"] / max(overall_stats["processed_questions"], 1)
+    )
+    overall_stats["parsing_success_rate"] = (
+        overall_stats["parsed_queries"] / max(overall_stats["processed_questions"], 1)
+    )
+
+    for db_id, stats in merged_db_stats.items():
+        stats["accuracy"] = stats["correct"] / max(stats["executed"], 1)
+        stats["exact_match_accuracy"] = stats["exact_match"] / max(stats["total"], 1)
+        stats["parsing_success_rate"] = stats["parsed"] / max(stats["total"], 1)
+        stats["average_execution_time"] = stats["total_time"] / max(stats["total"], 1)
+
+    return {
+        "overall_statistics": overall_stats,
+        "per_database_statistics": dict(merged_db_stats),
+        "detailed_results": merged_results,
+    }
+
+
+def run_evaluation_worker(
+    worker_index: int,
+    gpu_id: int,
+    questions_shard: List[Dict[str, Any]],
+    worker_output_path: str,
+    base_model: str,
+    databases: str,
+    metadata_index: Optional[str],
+    question_index: Optional[str],
+    sql_index: Optional[str],
+    schema_linking_results: Optional[str],
+    round_1_max_new_tokens: int,
+    round_2_max_new_tokens: int,
+) -> None:
+    print(f"[Worker {worker_index}] Starting on GPU {gpu_id} with {len(questions_shard)} questions...")
+
+    pipeline = BaseModelSQLPipeline(
+        base_model=base_model,
+        round_1_max_new_tokens=round_1_max_new_tokens,
+        round_2_max_new_tokens=round_2_max_new_tokens,
+        gpu_id=gpu_id,
+    )
+    if metadata_index and os.path.exists(metadata_index):
+        pipeline.load_retrieval_index(
+            metadata_index,
+            question_index_path=question_index,
+            sql_index_path=sql_index,
+        )
+
+    schema_linking_lookup = None
+    if schema_linking_results and os.path.exists(schema_linking_results):
+        schema_linking_lookup = load_schema_linking_results(schema_linking_results)
+
+    evaluator = SQLEvaluator(pipeline)
+    stats = evaluator.evaluate_questions(
+        questions_shard,
+        databases,
+        worker_output_path,
+        schema_linking_lookup=schema_linking_lookup,
+    )
+    pipeline.shutdown()
+
+    Path(worker_output_path).write_text(
+        json.dumps(stats, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    print(f"[Worker {worker_index}] Finished.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Base-model SQL pipeline and evaluation")
     parser.add_argument("--questions", required=True, help="Path to questions JSON file")
@@ -974,8 +1111,10 @@ def main() -> None:
         default="openai/gpt-oss-20b",
         help="Base model name or local path",
     )
-    parser.add_argument("--round-1-max-new-tokens", type=int, default=4096, help="Max new tokens for Round 1 generation")
-    parser.add_argument("--round-2-max-new-tokens", type=int, default=4096, help="Max new tokens for Round 2 generation")
+    parser.add_argument("--round-1-max-new-tokens", type=int, default=512, help="Max new tokens for Round 1 generation")
+    parser.add_argument("--round-2-max-new-tokens", type=int, default=512, help="Max new tokens for Round 2 generation")
+    parser.add_argument("--num-workers", type=int, help="Number of parallel evaluation workers; defaults to the number of GPU ids provided")
+    parser.add_argument("--gpu-ids", default="0,1,2,3", help="Comma-separated GPU ids to use, one per worker")
     parser.add_argument(
         "--output",
         default="sql_pipeline_evaluation_results.json",
@@ -992,38 +1131,66 @@ def main() -> None:
     print(f"[Setup] Loading questions from {args.questions}...")
     questions_data = json.loads(Path(args.questions).read_text(encoding="utf-8"))
 
-    print("[Setup] Initializing base-model SQL pipeline...")
-    pipeline = BaseModelSQLPipeline(
-        base_model=args.base_model,
-        round_1_max_new_tokens=args.round_1_max_new_tokens,
-        round_2_max_new_tokens=args.round_2_max_new_tokens,
-    )
+    gpu_ids = [int(item.strip()) for item in args.gpu_ids.split(",") if item.strip()]
+    if not gpu_ids:
+        raise ValueError("Provide at least one GPU id via --gpu-ids")
+
+    num_workers = args.num_workers or len(gpu_ids)
+    if num_workers > len(gpu_ids):
+        raise ValueError("--num-workers cannot exceed the number of GPU ids provided")
+
+    selected_gpu_ids = gpu_ids[:num_workers]
+    print("[Setup] Initializing sharded base-model SQL evaluation...")
     if args.metadata_index and os.path.exists(args.metadata_index):
         print(f"[Setup] Loading structural retrieval data from {args.metadata_index}...")
-        pipeline.load_retrieval_index(
-            args.metadata_index,
-            question_index_path=args.question_index,
-            sql_index_path=args.sql_index,
-        )
-    print("[Setup] SQL pipeline ready.")
-
-    evaluator = SQLEvaluator(pipeline)
-    schema_linking_lookup = None
     if args.schema_linking_results and os.path.exists(args.schema_linking_results):
         print(f"[Setup] Loading schema-linking results from {args.schema_linking_results}...")
-        schema_linking_lookup = load_schema_linking_results(args.schema_linking_results)
-    print("[Run] Starting evaluation...")
-    stats = evaluator.evaluate_questions(
-        questions_data,
-        args.databases,
-        args.output,
-        schema_linking_lookup=schema_linking_lookup,
+    print(f"[Setup] Using {num_workers} workers on GPU ids: {selected_gpu_ids}")
+
+    shards = split_questions_into_shards(questions_data, num_workers)
+    temp_dir = Path(tempfile.mkdtemp(prefix="sql_eval_shards_"))
+    worker_outputs = [temp_dir / f"worker_{index}.json" for index in range(len(shards))]
+
+    ctx = mp.get_context("spawn")
+    processes: List[mp.Process] = []
+    for worker_index, (gpu_id, shard, worker_output) in enumerate(zip(selected_gpu_ids, shards, worker_outputs)):
+        process = ctx.Process(
+            target=run_evaluation_worker,
+            args=(
+                worker_index,
+                gpu_id,
+                shard,
+                str(worker_output),
+                args.base_model,
+                args.databases,
+                args.metadata_index,
+                args.question_index,
+                args.sql_index,
+                args.schema_linking_results,
+                args.round_1_max_new_tokens,
+                args.round_2_max_new_tokens,
+            ),
+        )
+        process.start()
+        processes.append(process)
+
+    for process in processes:
+        process.join()
+        if process.exitcode != 0:
+            raise RuntimeError(f"Evaluation worker failed with exit code {process.exitcode}")
+
+    shard_outputs = [
+        json.loads(Path(worker_output).read_text(encoding="utf-8"))
+        for worker_output in worker_outputs
+        if Path(worker_output).exists()
+    ]
+    stats = merge_shard_outputs(shard_outputs, questions_data)
+    Path(args.output).write_text(
+        json.dumps(stats, indent=2, ensure_ascii=False),
+        encoding="utf-8",
     )
     print_summary(stats)
     print(f"\n[Run] Detailed results saved to: {args.output}")
-
-    print("[Cleanup] Releasing resources...")
-    pipeline.shutdown()
 
 
 if __name__ == "__main__":
