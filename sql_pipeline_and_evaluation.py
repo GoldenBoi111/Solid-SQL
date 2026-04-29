@@ -560,7 +560,7 @@ class BaseModelSQLPipeline:
         self.gpu_id = gpu_id
         self._model = None
         self._tokenizer = None
-        self._sql_response_generator = None
+        self._outlines_model = None
         self.sql_extractor = SQLSkeletonExtractor(dialect=sql_dialect)
         self.retriever = SolidSQLRetriever(
             candidate_examples=self.candidate_examples,
@@ -596,16 +596,15 @@ class BaseModelSQLPipeline:
         self._model.eval()
         if outlines is not None:
             try:
-                outlines_model = outlines.from_transformers(self._model, self._tokenizer)
+                self._outlines_model = outlines.from_transformers(self._model, self._tokenizer)
                 if BaseModel is not None:
-                    self._sql_response_generator = outlines.generate.json(outlines_model, SqlResponse)
                     print("[Setup] Outlines structured SQL generation enabled.")
                 else:
-                    self._sql_response_generator = None
                     print("[Setup] Outlines imported, but Pydantic is unavailable; using raw text fallback.")
-            except Exception:
-                self._sql_response_generator = None
-                print("[Setup] Outlines initialization failed; using raw text fallback.")
+            except Exception as exc:
+                self._outlines_model = None
+                print(f"[Setup] Outlines initialization failed; using raw text fallback. Reason: {exc}")
+                print(traceback.format_exc())
         else:
             print("[Setup] Outlines not available; using raw text fallback.")
 
@@ -650,9 +649,9 @@ class BaseModelSQLPipeline:
     def _generate_sql_response(self, prompt: str, max_new_tokens: int = 4096) -> Dict[str, str]:
         self._load_model()
 
-        if self._sql_response_generator is not None:
+        if self._outlines_model is not None and BaseModel is not None:
             try:
-                response = self._sql_response_generator(prompt, max_new_tokens=max_new_tokens)
+                response = self._outlines_model(prompt, SqlResponse, max_new_tokens=max_new_tokens)
                 if hasattr(response, "model_dump"):
                     response = response.model_dump()
                 elif isinstance(response, str):
