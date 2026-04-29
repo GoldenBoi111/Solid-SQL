@@ -261,11 +261,11 @@ def build_question_log_record(
     }
 
 
-def write_question_log(logs_dir: str, question_id: Any, payload: Dict[str, Any]) -> None:
+def write_question_logs_array(logs_dir: str, payloads: List[Dict[str, Any]]) -> None:
     path = Path(logs_dir)
     path.mkdir(parents=True, exist_ok=True)
-    log_path = path / f"question_{question_id}.json"
-    log_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    log_path = path / "all_outputs.json"
+    log_path.write_text(json.dumps(payloads, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def parse_sql(sql: str, dialect: str = "sqlite") -> Tuple[bool, Optional[str], Optional[str]]:
@@ -827,6 +827,7 @@ class SQLEvaluator:
         schema_linking_lookup: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         results: List[Dict[str, Any]] = []
+        question_logs: List[Dict[str, Any]] = []
         db_stats = defaultdict(
             lambda: {
                 "total": 0,
@@ -861,9 +862,7 @@ class SQLEvaluator:
                     db_stats[db_id]["total"] += 1
                     db_stats[db_id]["errors"] += 1
                     if logs_dir:
-                        write_question_log(
-                            logs_dir,
-                            question_id,
+                        question_logs.append(
                             build_question_log_record(
                                 question_id=question_id,
                                 question=question,
@@ -874,7 +873,7 @@ class SQLEvaluator:
                                 is_correct=False,
                                 execution_times=[],
                                 execution_error=f"Missing database file for {db_id}",
-                            ),
+                            )
                         )
                     continue
 
@@ -886,9 +885,7 @@ class SQLEvaluator:
                     db_stats[db_id]["total"] += 1
                     db_stats[db_id]["errors"] += 1
                     if logs_dir:
-                        write_question_log(
-                            logs_dir,
-                            question_id,
+                        question_logs.append(
                             build_question_log_record(
                                 question_id=question_id,
                                 question=question,
@@ -899,7 +896,7 @@ class SQLEvaluator:
                                 is_correct=False,
                                 execution_times=[],
                                 execution_error=f"Schema load failed for {db_id}",
-                            ),
+                            )
                         )
                     continue
                 db_cache[db_id] = {"schema": schema_text, "path": db_path}
@@ -986,7 +983,7 @@ class SQLEvaluator:
                         execution_times=[generated_exec_time],
                         execution_error=generated_exec_error,
                     )
-                    write_question_log(logs_dir, question_id, log_record)
+                    question_logs.append(log_record)
                 print(f"[Stage 5: Outcome] Final status: {'correct' if execution_match else 'incorrect'}")
                 print(f"[Stage 5: Outcome] Parsed successfully: {generation['final_parsed']}")
                 print(f"[Stage 5: Outcome] Execution time: {execution_time:.4f}s")
@@ -1023,7 +1020,7 @@ class SQLEvaluator:
                         execution_times=[execution_time],
                         execution_error=str(exc),
                     )
-                    write_question_log(logs_dir, question_id, log_record)
+                    question_logs.append(log_record)
                 print(f"[Stage 5: Outcome] Error processing question {question_id}: {exc}")
                 print(traceback_text)
                 print(f"[Stage 5: Outcome] Execution time before failure: {execution_time:.4f}s")
@@ -1057,6 +1054,8 @@ class SQLEvaluator:
             "per_database_statistics": dict(db_stats),
             "detailed_results": results,
         }
+        if logs_dir:
+            write_question_logs_array(logs_dir, question_logs)
         Path(output_file).write_text(
             json.dumps(output_data, indent=2, ensure_ascii=False),
             encoding="utf-8",
@@ -1164,8 +1163,10 @@ def write_combined_question_logs(logs_dir: str, original_questions: List[Dict[st
     logs_path.mkdir(parents=True, exist_ok=True)
     order = {str(item.get("question_id", index)): index for index, item in enumerate(original_questions)}
     records = []
-    for log_file in logs_path.glob("question_*.json"):
-        records.append(json.loads(log_file.read_text(encoding="utf-8")))
+    for gpu_dir in sorted(path for path in logs_path.iterdir() if path.is_dir() and path.name.startswith("gpu_")):
+        log_file = gpu_dir / "all_outputs.json"
+        if log_file.exists():
+            records.extend(json.loads(log_file.read_text(encoding="utf-8")))
     records.sort(key=lambda item: order.get(str(item.get("question_id")), 10**9))
     (logs_path / "all_outputs.json").write_text(
         json.dumps(records, indent=2, ensure_ascii=False),
@@ -1248,7 +1249,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--question-logs-dir",
-        help="Directory for per-question JSON logs and combined all_outputs.json",
+        help="Root directory for GPU-sharded log folders and merged all_outputs.json",
     )
 
     args = parser.parse_args()
@@ -1282,7 +1283,7 @@ def main() -> None:
     if args.schema_linking_results and os.path.exists(args.schema_linking_results):
         print(f"[Setup] Loading schema-linking results from {args.schema_linking_results}...")
     print(f"[Setup] Using {num_workers} workers on GPU ids: {selected_gpu_ids}")
-    print(f"[Setup] Writing per-question logs to {question_logs_dir}...")
+    print(f"[Setup] Writing GPU-sharded logs to {question_logs_dir}...")
 
     shards = split_questions_into_shards(questions_data, num_workers)
     temp_dir = Path(tempfile.mkdtemp(prefix="sql_eval_shards_"))
@@ -1291,6 +1292,7 @@ def main() -> None:
     ctx = mp.get_context("spawn")
     processes: List[mp.Process] = []
     for worker_index, (gpu_id, shard, worker_output) in enumerate(zip(selected_gpu_ids, shards, worker_outputs)):
+        gpu_logs_dir = Path(question_logs_dir) / f"gpu_{gpu_id}"
         process = ctx.Process(
             target=run_evaluation_worker,
             args=(
@@ -1298,7 +1300,7 @@ def main() -> None:
                 gpu_id,
                 shard,
                 str(worker_output),
-                question_logs_dir,
+                str(gpu_logs_dir),
                 args.base_model,
                 args.databases,
                 args.metadata_index,
@@ -1330,7 +1332,7 @@ def main() -> None:
     write_combined_question_logs(question_logs_dir, questions_data)
     print_summary(stats)
     print(f"\n[Run] Detailed results saved to: {args.output}")
-    print(f"[Run] Per-question logs saved to: {question_logs_dir}")
+    print(f"[Run] GPU-sharded logs saved to: {question_logs_dir}")
 
 
 if __name__ == "__main__":
