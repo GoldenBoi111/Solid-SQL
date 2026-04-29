@@ -161,6 +161,8 @@ def parse_sql(sql: str, dialect: str = "sqlite") -> Tuple[bool, Optional[str], O
         return True, normalized, None
     except sqlglot.errors.ParseError as exc:
         return False, None, str(exc)
+    except RecursionError as exc:
+        return False, None, f"RecursionError during SQL parsing: {exc}"
 
 
 def clean_sql_output(sql: str) -> str:
@@ -205,6 +207,12 @@ def clean_sql_output(sql: str) -> str:
 
     if ";" in cleaned_sql:
         cleaned_sql = cleaned_sql.split(";")[0] + ";"
+
+    max_sql_length = 4000
+    if len(cleaned_sql) > max_sql_length:
+        cleaned_sql = cleaned_sql[:max_sql_length].rstrip()
+        if ";" not in cleaned_sql:
+            cleaned_sql += ";"
 
     placeholder_sql = {
         "SELECT ...",
@@ -312,12 +320,18 @@ class BaseModelSQLPipeline:
         candidate_examples: Optional[List[Dict[str, str]]] = None,
         embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
         sql_dialect: str = "sqlite",
+        round_1_max_new_tokens: int = 4096,
+        round_2_max_new_tokens: int = 4096,
+        repair_max_new_tokens: int = 128,
     ) -> None:
         self.base_model_name = base_model
         self.candidate_examples = candidate_examples or []
         self.embedding_model = embedding_model
         self.sql_dialect = sql_dialect
         self.max_seq_length = 2048
+        self.round_1_max_new_tokens = round_1_max_new_tokens
+        self.round_2_max_new_tokens = round_2_max_new_tokens
+        self.repair_max_new_tokens = repair_max_new_tokens
         self._model = None
         self._tokenizer = None
         self.sql_extractor = SQLSkeletonExtractor(dialect=sql_dialect)
@@ -352,7 +366,7 @@ class BaseModelSQLPipeline:
         self.structural_retriever.load_index(metadata_path, sql_index_path=sql_index_path)
         self.candidate_examples = self.structural_retriever.candidates
 
-    def _generate_text(self, prompt: str, max_new_tokens: int = 768) -> str:
+    def _generate_text(self, prompt: str, max_new_tokens: int = 4096) -> str:
         self._load_model()
         device = next(self._model.parameters()).device
         inputs = self._tokenizer(
@@ -542,9 +556,19 @@ class BaseModelSQLPipeline:
         question: str,
         schema_json: Dict[str, Any],
         sql: str,
-        max_new_tokens: int = 512,
+        max_new_tokens: Optional[int] = None,
     ) -> Dict[str, Any]:
+        if max_new_tokens is None:
+            max_new_tokens = self.repair_max_new_tokens
         cleaned_sql = clean_sql_output(sql)
+        if not cleaned_sql:
+            return {
+                "sql": "",
+                "parsed": False,
+                "normalized_sql": None,
+                "repair_attempted": False,
+                "repair_error": "Empty SQL after cleanup",
+            }
         parsed_ok, normalized_sql, parse_error = parse_sql(cleaned_sql, dialect=self.sql_dialect)
 
         if parsed_ok:
@@ -555,18 +579,12 @@ class BaseModelSQLPipeline:
                 "repair_attempted": False,
                 "repair_error": None,
             }
-
-        repair_prompt = self._repair_prompt(question, schema_json, cleaned_sql, parse_error or "Unknown parse error")
-        repaired_text = self._generate_text(repair_prompt, max_new_tokens=max_new_tokens)
-        repaired_sql = clean_sql_output(repaired_text)
-        repaired_ok, repaired_normalized, repaired_error = parse_sql(repaired_sql, dialect=self.sql_dialect)
-
         return {
-            "sql": repaired_sql if repaired_ok else cleaned_sql,
-            "parsed": repaired_ok,
-            "normalized_sql": repaired_normalized if repaired_ok else None,
-            "repair_attempted": True,
-            "repair_error": repaired_error if not repaired_ok else None,
+            "sql": cleaned_sql,
+            "parsed": False,
+            "normalized_sql": None,
+            "repair_attempted": False,
+            "repair_error": parse_error,
             "original_parse_error": parse_error,
         }
 
@@ -576,15 +594,20 @@ class BaseModelSQLPipeline:
         schema_json: Dict[str, Any],
         round_1_examples: int = 3,
         round_2_examples: int = 3,
-        max_new_tokens: int = 768,
     ) -> Dict[str, Any]:
         few_shot_examples = self._select_few_shot_examples(question, top_n=round_1_examples)
         round_1_prompt = self._round_1_prompt(question, schema_json, few_shot_examples)
-        round_1_raw = self._generate_text(round_1_prompt, max_new_tokens=max_new_tokens)
+        print("[Stage 2.1] Generating Round 1 SQL...")
+        round_1_raw = self._generate_text(
+            round_1_prompt,
+            max_new_tokens=self.round_1_max_new_tokens,
+        )
         round_1_sql = clean_sql_output(round_1_raw)
+        print("[Stage 2.2] Validating Round 1 SQL...")
         round_1_validation = self.validate_and_repair_sql(question, schema_json, round_1_sql)
         validated_round_1_sql = round_1_validation["sql"]
 
+        print("[Stage 2.3] Retrieving structurally similar SQL examples...")
         structural_examples = self.structural_retriever.retrieve(
             validated_round_1_sql or round_1_sql,
             top_n=round_2_examples,
@@ -595,8 +618,13 @@ class BaseModelSQLPipeline:
             validated_round_1_sql or round_1_sql,
             structural_examples,
         )
-        round_2_raw = self._generate_text(round_2_prompt, max_new_tokens=max_new_tokens)
+        print("[Stage 2.4] Generating Round 2 refined SQL...")
+        round_2_raw = self._generate_text(
+            round_2_prompt,
+            max_new_tokens=self.round_2_max_new_tokens,
+        )
         round_2_sql = clean_sql_output(round_2_raw)
+        print("[Stage 2.5] Validating final SQL...")
         round_2_validation = self.validate_and_repair_sql(question, schema_json, round_2_sql)
 
         final_sql = round_2_validation["sql"] or validated_round_1_sql or round_1_sql
@@ -864,6 +892,9 @@ def main() -> None:
         default="openai/gpt-oss-20b",
         help="Base model name or local path",
     )
+    parser.add_argument("--round-1-max-new-tokens", type=int, default=4096, help="Max new tokens for Round 1 generation")
+    parser.add_argument("--round-2-max-new-tokens", type=int, default=4096, help="Max new tokens for Round 2 generation")
+    parser.add_argument("--repair-max-new-tokens", type=int, default=128, help="Max new tokens for SQL repair generation")
     parser.add_argument(
         "--output",
         default="sql_pipeline_evaluation_results.json",
@@ -881,7 +912,12 @@ def main() -> None:
     questions_data = json.loads(Path(args.questions).read_text(encoding="utf-8"))
 
     print("[Setup] Initializing base-model SQL pipeline...")
-    pipeline = BaseModelSQLPipeline(base_model=args.base_model)
+    pipeline = BaseModelSQLPipeline(
+        base_model=args.base_model,
+        round_1_max_new_tokens=args.round_1_max_new_tokens,
+        round_2_max_new_tokens=args.round_2_max_new_tokens,
+        repair_max_new_tokens=args.repair_max_new_tokens,
+    )
     if args.metadata_index and os.path.exists(args.metadata_index):
         print(f"[Setup] Loading structural retrieval data from {args.metadata_index}...")
         pipeline.load_structural_index(args.metadata_index, sql_index_path=args.sql_index)
