@@ -183,6 +183,20 @@ def execute_sql_and_fetch_results(db_path: str, sql: str) -> List[Tuple]:
         return []
 
 
+def execute_sql_with_metadata(db_path: str, sql: str) -> Tuple[List[Tuple], float, Optional[str]]:
+    start_time = time.time()
+    try:
+        connection = sqlite3.connect(db_path)
+        cursor = connection.cursor()
+        cursor.execute(sql)
+        results = cursor.fetchall()
+        connection.close()
+        return results, time.time() - start_time, None
+    except Exception as exc:
+        print(f"Warning: Could not execute SQL on {db_path}: {exc}")
+        return [], time.time() - start_time, str(exc)
+
+
 def compare_execution_results(
     generated_results: List[Tuple],
     ground_truth_results: List[Tuple],
@@ -191,6 +205,67 @@ def compare_execution_results(
         return set(generated_results) == set(ground_truth_results)
     except Exception:
         return generated_results == ground_truth_results
+
+
+def build_question_log_record(
+    *,
+    question_id: Any,
+    question: str,
+    db_id: str,
+    difficulty: str,
+    ground_truth_sql: str,
+    winner_sql: str,
+    is_correct: bool,
+    execution_times: List[float],
+    execution_error: Optional[str] = None,
+) -> Dict[str, Any]:
+    has_sql = bool((winner_sql or "").strip())
+    valid_generation = int(has_sql)
+    execution_errors = 1 if execution_error else 0
+    unique_valid_sqls = 1 if has_sql else 0
+    alternatives = []
+    if has_sql:
+        best_exec_time = min(execution_times) if execution_times else None
+        alternatives.append(
+            {
+                "sql": winner_sql,
+                "confidence": 1.0,
+                "count": 1,
+                "best_exec_time": best_exec_time,
+                "all_sqls_in_group": [winner_sql],
+            }
+        )
+
+    return {
+        "question_id": question_id,
+        "question": question,
+        "db_id": db_id,
+        "difficulty": difficulty or "unknown",
+        "ground_truth": ground_truth_sql,
+        "winner_sql": winner_sql,
+        "is_correct": is_correct,
+        "winner_confidence": 1.0 if has_sql else 0.0,
+        "execution_times": execution_times,
+        "high_confidence_alternatives": alternatives,
+        "selection": {
+            "selected_sql": winner_sql,
+            "reasoning": "Single candidate - no selection needed" if has_sql else "No valid SQL candidate generated",
+            "candidates_count": 1 if has_sql else 0,
+        },
+        "metrics": {
+            "generated": 1,
+            "execution_errors": execution_errors,
+            "valid_generations": valid_generation,
+            "unique_valid_sqls": unique_valid_sqls,
+        },
+    }
+
+
+def write_question_log(logs_dir: str, question_id: Any, payload: Dict[str, Any]) -> None:
+    path = Path(logs_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    log_path = path / f"question_{question_id}.json"
+    log_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def parse_sql(sql: str, dialect: str = "sqlite") -> Tuple[bool, Optional[str], Optional[str]]:
@@ -265,14 +340,6 @@ def clean_sql_output(sql: str) -> str:
         return ""
 
     return cleaned_sql.strip()
-
-
-def exact_match_sql(predicted_sql: str, ground_truth_sql: str, dialect: str = "sqlite") -> bool:
-    predicted_ok, predicted_normalized, _ = parse_sql(predicted_sql, dialect=dialect)
-    ground_truth_ok, ground_truth_normalized, _ = parse_sql(ground_truth_sql, dialect=dialect)
-    if not predicted_ok or not ground_truth_ok:
-        return False
-    return predicted_normalized == ground_truth_normalized
 
 
 class SolidSQLRetriever:
@@ -756,6 +823,7 @@ class SQLEvaluator:
         questions_data: List[Dict[str, Any]],
         databases_dir: str,
         output_file: str,
+        logs_dir: Optional[str] = None,
         schema_linking_lookup: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         results: List[Dict[str, Any]] = []
@@ -763,7 +831,6 @@ class SQLEvaluator:
             lambda: {
                 "total": 0,
                 "correct": 0,
-                "exact_match": 0,
                 "parsed": 0,
                 "executed": 0,
                 "errors": 0,
@@ -778,6 +845,7 @@ class SQLEvaluator:
             question_id = item.get("question_id", index)
             question = item["question"]
             db_id = item["db_id"]
+            difficulty = item.get("difficulty", "unknown")
             ground_truth_sql = item.get("SQL", item.get("sql", ""))
 
             print("\n" + "-" * 80)
@@ -790,6 +858,24 @@ class SQLEvaluator:
                 db_path = os.path.join(databases_dir, f"{db_id}.sqlite")
                 if not os.path.exists(db_path):
                     print(f"[Database Lookup] Missing database file for {db_id}")
+                    db_stats[db_id]["total"] += 1
+                    db_stats[db_id]["errors"] += 1
+                    if logs_dir:
+                        write_question_log(
+                            logs_dir,
+                            question_id,
+                            build_question_log_record(
+                                question_id=question_id,
+                                question=question,
+                                db_id=db_id,
+                                difficulty=difficulty,
+                                ground_truth_sql=ground_truth_sql,
+                                winner_sql="",
+                                is_correct=False,
+                                execution_times=[],
+                                execution_error=f"Missing database file for {db_id}",
+                            ),
+                        )
                     continue
 
             print("[Stage 1: Schema Load] Loading schema text...")
@@ -797,6 +883,24 @@ class SQLEvaluator:
                 schema_text = load_schema_for_db(db_path)
                 if not schema_text:
                     print(f"[Stage 1: Schema Load] Failed for {db_id}")
+                    db_stats[db_id]["total"] += 1
+                    db_stats[db_id]["errors"] += 1
+                    if logs_dir:
+                        write_question_log(
+                            logs_dir,
+                            question_id,
+                            build_question_log_record(
+                                question_id=question_id,
+                                question=question,
+                                db_id=db_id,
+                                difficulty=difficulty,
+                                ground_truth_sql=ground_truth_sql,
+                                winner_sql="",
+                                is_correct=False,
+                                execution_times=[],
+                                execution_error=f"Schema load failed for {db_id}",
+                            ),
+                        )
                     continue
                 db_cache[db_id] = {"schema": schema_text, "path": db_path}
                 print("[Stage 1: Schema Load] Loaded from SQLite and cached.")
@@ -835,16 +939,15 @@ class SQLEvaluator:
                     db_stats[db_id]["parsed"] += 1
 
                 print("[Stage 3: Execution] Running generated SQL against SQLite...")
-                generated_results = execute_sql_and_fetch_results(db_path, final_sql)
+                generated_results, generated_exec_time, generated_exec_error = execute_sql_with_metadata(db_path, final_sql)
                 print(f"[Stage 3: Execution] Generated SQL rows: {len(generated_results)}")
                 print("[Stage 3: Execution] Running ground-truth SQL against SQLite...")
-                ground_truth_results = execute_sql_and_fetch_results(db_path, ground_truth_sql)
+                ground_truth_results, _, _ = execute_sql_with_metadata(db_path, ground_truth_sql)
                 print(f"[Stage 3: Execution] Ground-truth rows: {len(ground_truth_results)}")
 
                 db_stats[db_id]["executed"] += 1
 
                 execution_match = compare_execution_results(generated_results, ground_truth_results)
-                exact_match = exact_match_sql(final_sql, ground_truth_sql, dialect=self.sql_dialect)
 
                 print("[Stage 4: Comparison] Comparing execution results...")
                 if execution_match:
@@ -853,30 +956,39 @@ class SQLEvaluator:
                 else:
                     print("[Stage 4: Comparison] Execution result: MISMATCH")
 
-                if exact_match:
-                    db_stats[db_id]["exact_match"] += 1
-
                 results.append(
                     {
                         "question_id": question_id,
                         "db_id": db_id,
                         "question": question,
+                        "difficulty": difficulty,
                         "generated_sql": final_sql,
                         "ground_truth_sql": ground_truth_sql,
                         "schema_linking_used": linked_schema_record is not None,
                         "round_1_sql": generation["round_1_sql"],
                         "round_2_sql": generation["round_2_sql"],
                         "execution_match": execution_match,
-                        "exact_match": exact_match,
                         "parsed": generation["final_parsed"],
                         "parse_error": generation["final_parse_error"],
                         "execution_time": execution_time,
                         "retrieved_examples": len(generation["structural_examples"]),
                     }
                 )
+                if logs_dir:
+                    log_record = build_question_log_record(
+                        question_id=question_id,
+                        question=question,
+                        db_id=db_id,
+                        difficulty=difficulty,
+                        ground_truth_sql=ground_truth_sql,
+                        winner_sql=final_sql,
+                        is_correct=execution_match,
+                        execution_times=[generated_exec_time],
+                        execution_error=generated_exec_error,
+                    )
+                    write_question_log(logs_dir, question_id, log_record)
                 print(f"[Stage 5: Outcome] Final status: {'correct' if execution_match else 'incorrect'}")
                 print(f"[Stage 5: Outcome] Parsed successfully: {generation['final_parsed']}")
-                print(f"[Stage 5: Outcome] Exact match: {exact_match}")
                 print(f"[Stage 5: Outcome] Execution time: {execution_time:.4f}s")
 
             except Exception as exc:
@@ -889,16 +1001,29 @@ class SQLEvaluator:
                         "question_id": question_id,
                         "db_id": db_id,
                         "question": question,
+                        "difficulty": difficulty,
                         "generated_sql": "",
                         "ground_truth_sql": ground_truth_sql,
                         "error": str(exc),
                         "traceback": traceback_text,
                         "execution_time": execution_time,
                         "execution_match": False,
-                        "exact_match": False,
                         "parsed": False,
                     }
                 )
+                if logs_dir:
+                    log_record = build_question_log_record(
+                        question_id=question_id,
+                        question=question,
+                        db_id=db_id,
+                        difficulty=difficulty,
+                        ground_truth_sql=ground_truth_sql,
+                        winner_sql="",
+                        is_correct=False,
+                        execution_times=[execution_time],
+                        execution_error=str(exc),
+                    )
+                    write_question_log(logs_dir, question_id, log_record)
                 print(f"[Stage 5: Outcome] Error processing question {question_id}: {exc}")
                 print(traceback_text)
                 print(f"[Stage 5: Outcome] Execution time before failure: {execution_time:.4f}s")
@@ -907,7 +1032,6 @@ class SQLEvaluator:
             "total_questions": len(questions_data),
             "processed_questions": sum(stats["total"] for stats in db_stats.values()),
             "correct_answers": sum(stats["correct"] for stats in db_stats.values()),
-            "exact_matches": sum(stats["exact_match"] for stats in db_stats.values()),
             "executed_queries": sum(stats["executed"] for stats in db_stats.values()),
             "parsed_queries": sum(stats["parsed"] for stats in db_stats.values()),
             "errors": sum(stats["errors"] for stats in db_stats.values()),
@@ -919,16 +1043,12 @@ class SQLEvaluator:
         overall_stats["execution_accuracy"] = (
             overall_stats["correct_answers"] / max(overall_stats["executed_queries"], 1)
         )
-        overall_stats["exact_match_accuracy"] = (
-            overall_stats["exact_matches"] / max(overall_stats["processed_questions"], 1)
-        )
         overall_stats["parsing_success_rate"] = (
             overall_stats["parsed_queries"] / max(overall_stats["processed_questions"], 1)
         )
 
         for db_id, stats in db_stats.items():
             stats["accuracy"] = stats["correct"] / max(stats["executed"], 1)
-            stats["exact_match_accuracy"] = stats["exact_match"] / max(stats["total"], 1)
             stats["parsing_success_rate"] = stats["parsed"] / max(stats["total"], 1)
             stats["average_execution_time"] = stats["total_time"] / max(stats["total"], 1)
 
@@ -953,11 +1073,9 @@ def print_summary(stats: Dict[str, Any]) -> None:
     print(f"Processed questions: {overall['processed_questions']}")
     print(f"Executed queries: {overall['executed_queries']}")
     print(f"Correct answers: {overall['correct_answers']}")
-    print(f"Exact matches: {overall['exact_matches']}")
     print(f"Parsed queries: {overall['parsed_queries']}")
     print(f"Errors: {overall['errors']}")
     print(f"Execution accuracy: {overall['execution_accuracy']:.4f}")
-    print(f"Exact match accuracy: {overall['exact_match_accuracy']:.4f}")
     print(f"Parsing success rate: {overall['parsing_success_rate']:.4f}")
     print(f"Average execution time: {overall['average_execution_time']:.4f}s")
 
@@ -966,7 +1084,6 @@ def print_summary(stats: Dict[str, Any]) -> None:
         print(f"  {db_id}:")
         print(f"    Questions: {db_stats['total']}")
         print(f"    Execution accuracy: {db_stats['accuracy']:.4f}")
-        print(f"    Exact match accuracy: {db_stats['exact_match_accuracy']:.4f}")
         print(f"    Parsing success rate: {db_stats['parsing_success_rate']:.4f}")
         print(f"    Average time: {db_stats['average_execution_time']:.4f}s")
 
@@ -990,7 +1107,6 @@ def merge_shard_outputs(
         lambda: {
             "total": 0,
             "correct": 0,
-            "exact_match": 0,
             "parsed": 0,
             "executed": 0,
             "errors": 0,
@@ -1004,7 +1120,6 @@ def merge_shard_outputs(
             target = merged_db_stats[db_id]
             target["total"] += stats.get("total", 0)
             target["correct"] += stats.get("correct", 0)
-            target["exact_match"] += stats.get("exact_match", 0)
             target["parsed"] += stats.get("parsed", 0)
             target["executed"] += stats.get("executed", 0)
             target["errors"] += stats.get("errors", 0)
@@ -1017,7 +1132,6 @@ def merge_shard_outputs(
         "total_questions": len(original_questions),
         "processed_questions": sum(stats["total"] for stats in merged_db_stats.values()),
         "correct_answers": sum(stats["correct"] for stats in merged_db_stats.values()),
-        "exact_matches": sum(stats["exact_match"] for stats in merged_db_stats.values()),
         "executed_queries": sum(stats["executed"] for stats in merged_db_stats.values()),
         "parsed_queries": sum(stats["parsed"] for stats in merged_db_stats.values()),
         "errors": sum(stats["errors"] for stats in merged_db_stats.values()),
@@ -1029,16 +1143,12 @@ def merge_shard_outputs(
     overall_stats["execution_accuracy"] = (
         overall_stats["correct_answers"] / max(overall_stats["executed_queries"], 1)
     )
-    overall_stats["exact_match_accuracy"] = (
-        overall_stats["exact_matches"] / max(overall_stats["processed_questions"], 1)
-    )
     overall_stats["parsing_success_rate"] = (
         overall_stats["parsed_queries"] / max(overall_stats["processed_questions"], 1)
     )
 
     for db_id, stats in merged_db_stats.items():
         stats["accuracy"] = stats["correct"] / max(stats["executed"], 1)
-        stats["exact_match_accuracy"] = stats["exact_match"] / max(stats["total"], 1)
         stats["parsing_success_rate"] = stats["parsed"] / max(stats["total"], 1)
         stats["average_execution_time"] = stats["total_time"] / max(stats["total"], 1)
 
@@ -1049,11 +1159,26 @@ def merge_shard_outputs(
     }
 
 
+def write_combined_question_logs(logs_dir: str, original_questions: List[Dict[str, Any]]) -> None:
+    logs_path = Path(logs_dir)
+    logs_path.mkdir(parents=True, exist_ok=True)
+    order = {str(item.get("question_id", index)): index for index, item in enumerate(original_questions)}
+    records = []
+    for log_file in logs_path.glob("question_*.json"):
+        records.append(json.loads(log_file.read_text(encoding="utf-8")))
+    records.sort(key=lambda item: order.get(str(item.get("question_id")), 10**9))
+    (logs_path / "all_outputs.json").write_text(
+        json.dumps(records, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
 def run_evaluation_worker(
     worker_index: int,
     gpu_id: int,
     questions_shard: List[Dict[str, Any]],
     worker_output_path: str,
+    logs_dir: str,
     base_model: str,
     databases: str,
     metadata_index: Optional[str],
@@ -1087,6 +1212,7 @@ def run_evaluation_worker(
         questions_shard,
         databases,
         worker_output_path,
+        logs_dir=logs_dir,
         schema_linking_lookup=schema_linking_lookup,
     )
     pipeline.shutdown()
@@ -1120,6 +1246,10 @@ def main() -> None:
         default="sql_pipeline_evaluation_results.json",
         help="Path to output results file",
     )
+    parser.add_argument(
+        "--question-logs-dir",
+        help="Directory for per-question JSON logs and combined all_outputs.json",
+    )
 
     args = parser.parse_args()
 
@@ -1127,6 +1257,12 @@ def main() -> None:
         raise FileNotFoundError(f"Questions file not found: {args.questions}")
     if not os.path.exists(args.databases):
         raise FileNotFoundError(f"Databases directory not found: {args.databases}")
+
+    question_logs_dir = args.question_logs_dir
+    if not question_logs_dir:
+        output_path = Path(args.output)
+        question_logs_dir = str(output_path.with_suffix("")) + "_question_logs"
+    Path(question_logs_dir).mkdir(parents=True, exist_ok=True)
 
     print(f"[Setup] Loading questions from {args.questions}...")
     questions_data = json.loads(Path(args.questions).read_text(encoding="utf-8"))
@@ -1146,6 +1282,7 @@ def main() -> None:
     if args.schema_linking_results and os.path.exists(args.schema_linking_results):
         print(f"[Setup] Loading schema-linking results from {args.schema_linking_results}...")
     print(f"[Setup] Using {num_workers} workers on GPU ids: {selected_gpu_ids}")
+    print(f"[Setup] Writing per-question logs to {question_logs_dir}...")
 
     shards = split_questions_into_shards(questions_data, num_workers)
     temp_dir = Path(tempfile.mkdtemp(prefix="sql_eval_shards_"))
@@ -1161,6 +1298,7 @@ def main() -> None:
                 gpu_id,
                 shard,
                 str(worker_output),
+                question_logs_dir,
                 args.base_model,
                 args.databases,
                 args.metadata_index,
@@ -1189,8 +1327,10 @@ def main() -> None:
         json.dumps(stats, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+    write_combined_question_logs(question_logs_dir, questions_data)
     print_summary(stats)
     print(f"\n[Run] Detailed results saved to: {args.output}")
+    print(f"[Run] Per-question logs saved to: {question_logs_dir}")
 
 
 if __name__ == "__main__":
