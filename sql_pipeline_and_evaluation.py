@@ -26,6 +26,7 @@ import sqlglot
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from schema_linking.question_skeleton_extractor import SKELETON_EXTRACTION_PROMPT
 from schema_linking.skeleton_similarity import SkeletonSimilarity
 from schema_linking.sql_skeleton_extractor import SQLSkeletonExtractor
 
@@ -236,8 +237,8 @@ def exact_match_sql(predicted_sql: str, ground_truth_sql: str, dialect: str = "s
     return predicted_normalized == ground_truth_normalized
 
 
-class SQLStructuralRetriever:
-    """SQL-only structural retriever with optional FAISS-backed search."""
+class SolidSQLRetriever:
+    """Question- and SQL-skeleton retriever with optional FAISS-backed search."""
 
     def __init__(
         self,
@@ -249,32 +250,86 @@ class SQLStructuralRetriever:
         self.sql_dialect = sql_dialect
         self.sql_extractor = SQLSkeletonExtractor(dialect=sql_dialect)
         self.similarity = SkeletonSimilarity(embedding_model=embedding_model)
+        self.question_skeletons: List[str] = []
+        self.question_index = None
         self.sql_skeletons: List[str] = []
         self.sql_index = None
 
-    def build_index(self, sql_skeletons: Optional[List[str]] = None) -> None:
+    def build_index(
+        self,
+        question_skeletons: Optional[List[str]] = None,
+        sql_skeletons: Optional[List[str]] = None,
+    ) -> None:
+        self.question_skeletons = question_skeletons or []
         self.sql_skeletons = sql_skeletons or self.sql_extractor.extract_batch(
             [example["sql"] for example in self.candidates],
             show_progress=False,
         )
 
-        if not FAISS_AVAILABLE or not self.sql_skeletons:
-            return
+        if FAISS_AVAILABLE and self.question_skeletons:
+            question_embeddings = self.similarity.get_question_embeddings(self.question_skeletons)
+            question_embedding_array = np.array(question_embeddings, dtype=np.float32)
+            self.question_index = faiss.IndexFlatL2(question_embedding_array.shape[1])
+            self.question_index.add(question_embedding_array)
 
-        embeddings = self.similarity.get_sql_embeddings(self.sql_skeletons)
-        embedding_array = np.array(embeddings, dtype=np.float32)
-        self.sql_index = faiss.IndexFlatL2(embedding_array.shape[1])
-        self.sql_index.add(embedding_array)
+        if FAISS_AVAILABLE and self.sql_skeletons:
+            embeddings = self.similarity.get_sql_embeddings(self.sql_skeletons)
+            embedding_array = np.array(embeddings, dtype=np.float32)
+            self.sql_index = faiss.IndexFlatL2(embedding_array.shape[1])
+            self.sql_index.add(embedding_array)
 
-    def load_index(self, metadata_path: str, sql_index_path: Optional[str] = None) -> None:
+    def load_index(
+        self,
+        metadata_path: str,
+        question_index_path: Optional[str] = None,
+        sql_index_path: Optional[str] = None,
+    ) -> None:
         metadata = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
         self.candidates = metadata.get("candidates", [])
+        self.question_skeletons = metadata.get("question_skeletons", [])
         self.sql_skeletons = metadata.get("sql_skeletons", [])
+
+        if question_index_path and FAISS_AVAILABLE and Path(question_index_path).exists():
+            self.question_index = faiss.read_index(question_index_path)
+        elif self.candidates and self.question_skeletons:
+            self.build_index(question_skeletons=self.question_skeletons, sql_skeletons=self.sql_skeletons or None)
 
         if sql_index_path and FAISS_AVAILABLE and Path(sql_index_path).exists():
             self.sql_index = faiss.read_index(sql_index_path)
         elif self.candidates:
-            self.build_index(sql_skeletons=self.sql_skeletons or None)
+            self.build_index(question_skeletons=self.question_skeletons or None, sql_skeletons=self.sql_skeletons or None)
+
+    def retrieve_by_question(self, question_skeleton: str, top_n: int = 3) -> List[Dict[str, Any]]:
+        if not self.candidates or not self.question_skeletons:
+            return []
+
+        if FAISS_AVAILABLE and self.question_index is not None:
+            embedding = self.similarity.get_question_embeddings([question_skeleton])[0]
+            embedding_array = np.array(embedding, dtype=np.float32).reshape(1, -1)
+            distances, indices = self.question_index.search(embedding_array, top_n)
+            ranked = []
+            for distance, index in zip(distances[0], indices[0]):
+                if index < 0 or index >= len(self.candidates):
+                    continue
+                ranked.append(
+                    {
+                        "example": self.candidates[index],
+                        "similarity_score": float(1.0 / (1.0 + distance)),
+                        "candidate_question_skeleton": self.question_skeletons[index],
+                    }
+                )
+            return ranked
+
+        similarities = self.similarity.question_similarity_batch(question_skeleton, self.question_skeletons)
+        indexed = sorted(enumerate(similarities), key=lambda item: item[1], reverse=True)[:top_n]
+        return [
+            {
+                "example": self.candidates[index],
+                "similarity_score": score,
+                "candidate_question_skeleton": self.question_skeletons[index],
+            }
+            for index, score in indexed
+        ]
 
     def retrieve(self, sql: str, top_n: int = 3) -> List[Dict[str, Any]]:
         if not self.candidates:
@@ -322,7 +377,6 @@ class BaseModelSQLPipeline:
         sql_dialect: str = "sqlite",
         round_1_max_new_tokens: int = 4096,
         round_2_max_new_tokens: int = 4096,
-        repair_max_new_tokens: int = 128,
     ) -> None:
         self.base_model_name = base_model
         self.candidate_examples = candidate_examples or []
@@ -331,17 +385,16 @@ class BaseModelSQLPipeline:
         self.max_seq_length = 2048
         self.round_1_max_new_tokens = round_1_max_new_tokens
         self.round_2_max_new_tokens = round_2_max_new_tokens
-        self.repair_max_new_tokens = repair_max_new_tokens
         self._model = None
         self._tokenizer = None
         self.sql_extractor = SQLSkeletonExtractor(dialect=sql_dialect)
-        self.structural_retriever = SQLStructuralRetriever(
+        self.retriever = SolidSQLRetriever(
             candidate_examples=self.candidate_examples,
             embedding_model=embedding_model,
             sql_dialect=sql_dialect,
         )
         if self.candidate_examples:
-            self.structural_retriever.build_index()
+            self.retriever.build_index()
 
     def _load_model(self) -> None:
         if self._model is not None:
@@ -359,12 +412,21 @@ class BaseModelSQLPipeline:
         )
         if self._tokenizer.pad_token is None:
             self._tokenizer.pad_token = self._tokenizer.eos_token
-        self._model.generation_config.use_cache = False
+        self._model.generation_config.use_cache = True
         self._model.eval()
 
-    def load_structural_index(self, metadata_path: str, sql_index_path: Optional[str] = None) -> None:
-        self.structural_retriever.load_index(metadata_path, sql_index_path=sql_index_path)
-        self.candidate_examples = self.structural_retriever.candidates
+    def load_retrieval_index(
+        self,
+        metadata_path: str,
+        question_index_path: Optional[str] = None,
+        sql_index_path: Optional[str] = None,
+    ) -> None:
+        self.retriever.load_index(
+            metadata_path,
+            question_index_path=question_index_path,
+            sql_index_path=sql_index_path,
+        )
+        self.candidate_examples = self.retriever.candidates
 
     def _generate_text(self, prompt: str, max_new_tokens: int = 4096) -> str:
         self._load_model()
@@ -382,7 +444,7 @@ class BaseModelSQLPipeline:
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
-                use_cache=False,
+                use_cache=True,
                 pad_token_id=self._tokenizer.pad_token_id,
                 eos_token_id=self._tokenizer.eos_token_id,
             )
@@ -391,19 +453,20 @@ class BaseModelSQLPipeline:
         generated_tokens = outputs[0][prompt_length:]
         return self._tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
-    def _select_few_shot_examples(self, question: str, top_n: int = 3) -> List[Dict[str, str]]:
-        if not self.candidate_examples:
-            return []
+    def _clean_skeleton_response(self, response: str) -> str:
+        response = response.strip()
+        if response.startswith('"') and response.endswith('"'):
+            response = response[1:-1]
+        elif response.startswith("'") and response.endswith("'"):
+            response = response[1:-1]
+        if "\n" in response:
+            response = response.split("\n")[0].strip()
+        return response
 
-        question_terms = set(question.lower().split())
-        scored_examples = []
-        for example in self.candidate_examples:
-            example_terms = set(example.get("question", "").lower().split())
-            overlap = len(question_terms & example_terms)
-            scored_examples.append((overlap, example))
-
-        scored_examples.sort(key=lambda item: item[0], reverse=True)
-        return [example for _, example in scored_examples[:top_n]]
+    def _extract_question_skeleton(self, question: str) -> str:
+        skeleton_prompt = SKELETON_EXTRACTION_PROMPT.format(question=question)
+        response = self._generate_text(skeleton_prompt, max_new_tokens=256)
+        return self._clean_skeleton_response(response)
 
     def _format_few_shot_examples(self, examples: List[Dict[str, str]]) -> str:
         if not examples:
@@ -527,47 +590,17 @@ class BaseModelSQLPipeline:
             "The answer must be a single executable SQLite query starting with SELECT or WITH.\n"
         )
 
-    def _repair_prompt(
+    def validate_sql(
         self,
-        question: str,
-        schema_json: Dict[str, Any],
-        invalid_sql: str,
-        parse_error: str,
-    ) -> str:
-        return (
-            "You repair invalid SQLite queries.\n\n"
-            "Given the user question, schema JSON, invalid SQL, and parse error, "
-            "return a repaired executable SQLite query.\n\n"
-            "Rules:\n"
-            "- Output SQL only\n"
-            "- Return one executable query starting with SELECT or WITH\n\n"
-            "## SCHEMA JSON\n"
-            f"{format_schema_json(schema_json)}\n\n"
-            "## USER QUESTION\n"
-            f"{question}\n\n"
-            "## INVALID SQL\n"
-            f"{invalid_sql}\n\n"
-            "## PARSE ERROR\n"
-            f"{parse_error}\n"
-        )
-
-    def validate_and_repair_sql(
-        self,
-        question: str,
-        schema_json: Dict[str, Any],
         sql: str,
-        max_new_tokens: Optional[int] = None,
     ) -> Dict[str, Any]:
-        if max_new_tokens is None:
-            max_new_tokens = self.repair_max_new_tokens
         cleaned_sql = clean_sql_output(sql)
         if not cleaned_sql:
             return {
                 "sql": "",
                 "parsed": False,
                 "normalized_sql": None,
-                "repair_attempted": False,
-                "repair_error": "Empty SQL after cleanup",
+                "parse_error": "Empty SQL after cleanup",
             }
         parsed_ok, normalized_sql, parse_error = parse_sql(cleaned_sql, dialect=self.sql_dialect)
 
@@ -576,16 +609,13 @@ class BaseModelSQLPipeline:
                 "sql": cleaned_sql,
                 "parsed": True,
                 "normalized_sql": normalized_sql,
-                "repair_attempted": False,
-                "repair_error": None,
+                "parse_error": None,
             }
         return {
             "sql": cleaned_sql,
             "parsed": False,
             "normalized_sql": None,
-            "repair_attempted": False,
-            "repair_error": parse_error,
-            "original_parse_error": parse_error,
+            "parse_error": parse_error,
         }
 
     def generate_sql(
@@ -595,7 +625,12 @@ class BaseModelSQLPipeline:
         round_1_examples: int = 3,
         round_2_examples: int = 3,
     ) -> Dict[str, Any]:
-        few_shot_examples = self._select_few_shot_examples(question, top_n=round_1_examples)
+        question_skeleton = self._extract_question_skeleton(question)
+        question_retrieval_results = self.retriever.retrieve_by_question(
+            question_skeleton,
+            top_n=round_1_examples,
+        )
+        few_shot_examples = [item["example"] for item in question_retrieval_results]
         round_1_prompt = self._round_1_prompt(question, schema_json, few_shot_examples)
         print("[Stage 2.1] Generating Round 1 SQL...")
         round_1_raw = self._generate_text(
@@ -604,11 +639,11 @@ class BaseModelSQLPipeline:
         )
         round_1_sql = clean_sql_output(round_1_raw)
         print("[Stage 2.2] Validating Round 1 SQL...")
-        round_1_validation = self.validate_and_repair_sql(question, schema_json, round_1_sql)
+        round_1_validation = self.validate_sql(round_1_sql)
         validated_round_1_sql = round_1_validation["sql"]
 
         print("[Stage 2.3] Retrieving structurally similar SQL examples...")
-        structural_examples = self.structural_retriever.retrieve(
+        structural_examples = self.retriever.retrieve(
             validated_round_1_sql or round_1_sql,
             top_n=round_2_examples,
         )
@@ -625,7 +660,7 @@ class BaseModelSQLPipeline:
         )
         round_2_sql = clean_sql_output(round_2_raw)
         print("[Stage 2.5] Validating final SQL...")
-        round_2_validation = self.validate_and_repair_sql(question, schema_json, round_2_sql)
+        round_2_validation = self.validate_sql(round_2_sql)
 
         final_sql = round_2_validation["sql"] or validated_round_1_sql or round_1_sql
         final_parse_ok, final_normalized, final_parse_error = parse_sql(final_sql, dialect=self.sql_dialect)
@@ -633,6 +668,8 @@ class BaseModelSQLPipeline:
         return {
             "question": question,
             "schema_json": schema_json,
+            "question_skeleton": question_skeleton,
+            "question_retrieval_results": question_retrieval_results,
             "round_1_sql": round_1_sql,
             "round_1_validation": round_1_validation,
             "structural_examples": structural_examples,
@@ -885,6 +922,7 @@ def main() -> None:
     parser.add_argument("--questions", required=True, help="Path to questions JSON file")
     parser.add_argument("--databases", required=True, help="Path to databases directory")
     parser.add_argument("--metadata-index", help="Path to retrieval metadata JSON")
+    parser.add_argument("--question-index", help="Path to question FAISS index")
     parser.add_argument("--sql-index", help="Path to SQL FAISS index")
     parser.add_argument("--schema-linking-results", help="Path to schema linking batch output JSON")
     parser.add_argument(
@@ -894,7 +932,6 @@ def main() -> None:
     )
     parser.add_argument("--round-1-max-new-tokens", type=int, default=4096, help="Max new tokens for Round 1 generation")
     parser.add_argument("--round-2-max-new-tokens", type=int, default=4096, help="Max new tokens for Round 2 generation")
-    parser.add_argument("--repair-max-new-tokens", type=int, default=128, help="Max new tokens for SQL repair generation")
     parser.add_argument(
         "--output",
         default="sql_pipeline_evaluation_results.json",
@@ -916,11 +953,14 @@ def main() -> None:
         base_model=args.base_model,
         round_1_max_new_tokens=args.round_1_max_new_tokens,
         round_2_max_new_tokens=args.round_2_max_new_tokens,
-        repair_max_new_tokens=args.repair_max_new_tokens,
     )
     if args.metadata_index and os.path.exists(args.metadata_index):
         print(f"[Setup] Loading structural retrieval data from {args.metadata_index}...")
-        pipeline.load_structural_index(args.metadata_index, sql_index_path=args.sql_index)
+        pipeline.load_retrieval_index(
+            args.metadata_index,
+            question_index_path=args.question_index,
+            sql_index_path=args.sql_index,
+        )
     print("[Setup] SQL pipeline ready.")
 
     evaluator = SQLEvaluator(pipeline)
