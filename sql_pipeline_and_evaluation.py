@@ -546,8 +546,8 @@ class BaseModelSQLPipeline:
         candidate_examples: Optional[List[Dict[str, str]]] = None,
         embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
         sql_dialect: str = "sqlite",
-        round_1_max_new_tokens: int = 512,
-        round_2_max_new_tokens: int = 512,
+        round_1_max_new_tokens: int = 4096,
+        round_2_max_new_tokens: int = 4096,
         gpu_id: Optional[int] = None,
     ) -> None:
         self.base_model_name = base_model
@@ -599,10 +599,15 @@ class BaseModelSQLPipeline:
                 outlines_model = outlines.from_transformers(self._model, self._tokenizer)
                 if BaseModel is not None:
                     self._sql_response_generator = outlines.generate.json(outlines_model, SqlResponse)
+                    print("[Setup] Outlines structured SQL generation enabled.")
                 else:
                     self._sql_response_generator = None
+                    print("[Setup] Outlines imported, but Pydantic is unavailable; using raw text fallback.")
             except Exception:
                 self._sql_response_generator = None
+                print("[Setup] Outlines initialization failed; using raw text fallback.")
+        else:
+            print("[Setup] Outlines not available; using raw text fallback.")
 
     def load_retrieval_index(
         self,
@@ -1404,8 +1409,8 @@ def main() -> None:
         default="openai/gpt-oss-20b",
         help="Base model name or local path",
     )
-    parser.add_argument("--round-1-max-new-tokens", type=int, default=512, help="Max new tokens for Round 1 generation")
-    parser.add_argument("--round-2-max-new-tokens", type=int, default=512, help="Max new tokens for Round 2 generation")
+    parser.add_argument("--round-1-max-new-tokens", type=int, default=4096, help="Max new tokens for Round 1 generation")
+    parser.add_argument("--round-2-max-new-tokens", type=int, default=4096, help="Max new tokens for Round 2 generation")
     parser.add_argument("--num-workers", type=int, help="Number of parallel evaluation workers; defaults to the number of GPU ids provided")
     parser.add_argument("--gpu-ids", default="0,1,2,3", help="Comma-separated GPU ids to use, one per worker")
     parser.add_argument(
