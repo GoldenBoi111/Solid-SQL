@@ -27,6 +27,16 @@ import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+try:
+    import outlines
+except ImportError:  # pragma: no cover - optional dependency on the execution machine
+    outlines = None
+
+try:
+    from pydantic import BaseModel
+except ImportError:  # pragma: no cover - optional dependency on the execution machine
+    BaseModel = None
+
 from schema_linking.question_skeleton_extractor import SKELETON_EXTRACTION_PROMPT
 from schema_linking.skeleton_similarity import SkeletonSimilarity
 from schema_linking.sql_skeleton_extractor import SQLSkeletonExtractor
@@ -73,6 +83,10 @@ SQL:
 {sql}
 
 Skeleton SQL:"""
+
+class SqlResponse(BaseModel if BaseModel is not None else object):
+    sql: str
+    reasoning: str
 
 
 def summarize_text(text: str, limit: int = 240) -> str:
@@ -241,8 +255,11 @@ def build_question_log_record(
     difficulty: str,
     gold_sql: str,
     round_1_sql: str,
+    round_1_reasoning: str,
     round_2_sql: str,
+    round_2_reasoning: str,
     winner_sql: str,
+    winner_reasoning: str,
     is_correct: bool,
     execution_times: List[float],
     generated_results: List[Tuple],
@@ -278,8 +295,11 @@ def build_question_log_record(
         "gold_sql": gold_sql,
         "ground_truth": gold_sql,
         "round_1_sql": round_1_sql,
+        "round_1_reasoning": round_1_reasoning,
         "round_2_sql": round_2_sql,
+        "round_2_reasoning": round_2_reasoning,
         "winner_sql": winner_sql,
+        "winner_reasoning": winner_reasoning,
         "generated_sql": winner_sql,
         "is_correct": is_correct,
         "winner_confidence": 1.0 if has_sql else 0.0,
@@ -291,7 +311,8 @@ def build_question_log_record(
         "high_confidence_alternatives": alternatives,
         "selection": {
             "selected_sql": winner_sql,
-            "reasoning": "Single candidate - no selection needed" if has_sql else "No valid SQL candidate generated",
+            "selected_reasoning": winner_reasoning,
+            "reasoning": winner_reasoning if has_sql else "No valid SQL candidate generated",
             "candidates_count": 1 if has_sql else 0,
         },
         "metrics": {
@@ -526,6 +547,7 @@ class BaseModelSQLPipeline:
         self.gpu_id = gpu_id
         self._model = None
         self._tokenizer = None
+        self._sql_response_generator = None
         self.sql_extractor = SQLSkeletonExtractor(dialect=sql_dialect)
         self.retriever = SolidSQLRetriever(
             candidate_examples=self.candidate_examples,
@@ -559,6 +581,15 @@ class BaseModelSQLPipeline:
             self._tokenizer.pad_token = self._tokenizer.eos_token
         self._model.generation_config.use_cache = True
         self._model.eval()
+        if outlines is not None:
+            try:
+                outlines_model = outlines.from_transformers(self._model, self._tokenizer)
+                if BaseModel is not None:
+                    self._sql_response_generator = outlines.generate.json(outlines_model, SqlResponse)
+                else:
+                    self._sql_response_generator = None
+            except Exception:
+                self._sql_response_generator = None
 
     def load_retrieval_index(
         self,
@@ -597,6 +628,35 @@ class BaseModelSQLPipeline:
         prompt_length = int(inputs["attention_mask"].sum(dim=1).tolist()[0])
         generated_tokens = outputs[0][prompt_length:]
         return self._tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+
+    def _generate_sql_response(self, prompt: str, max_new_tokens: int = 4096) -> Dict[str, str]:
+        self._load_model()
+
+        if self._sql_response_generator is not None:
+            try:
+                response = self._sql_response_generator(prompt, max_new_tokens=max_new_tokens)
+                if hasattr(response, "model_dump"):
+                    response = response.model_dump()
+                elif isinstance(response, str):
+                    response = json.loads(response)
+                elif not isinstance(response, dict):
+                    response = dict(response)
+                sql_text = clean_sql_output(str(response.get("sql", "")))
+                reasoning_text = str(response.get("reasoning", "")).strip()
+                return {"sql": sql_text, "reasoning": reasoning_text}
+            except Exception as exc:
+                print(f"Warning: Outlines structured generation failed; falling back to raw text: {exc}")
+
+        fallback_raw = self._generate_text(prompt, max_new_tokens=max_new_tokens)
+        try:
+            fallback_response = json.loads(fallback_raw)
+            if isinstance(fallback_response, dict):
+                sql_text = clean_sql_output(str(fallback_response.get("sql", "")))
+                reasoning_text = str(fallback_response.get("reasoning", "")).strip()
+                return {"sql": sql_text, "reasoning": reasoning_text}
+        except Exception:
+            pass
+        return {"sql": clean_sql_output(fallback_raw), "reasoning": ""}
 
     def _clean_skeleton_response(self, response: str) -> str:
         response = response.strip()
@@ -654,7 +714,8 @@ class BaseModelSQLPipeline:
             "- The SQL you generate is a DRAFT (Round 1 output)\n"
             "- It will be used for further refinement later\n"
             "- Do NOT try to be perfect; focus on following schema and example patterns\n"
-            "- Do NOT output explanations\n\n"
+            "- The database is SQLite, so use SQLite syntax\n"
+            "- Return a JSON object with exactly two keys: sql and reasoning\n\n"
             "---\n\n"
             "### DATABASE SCHEMA\n"
             f"{format_schema_json(schema_json)}\n\n"
@@ -673,8 +734,9 @@ class BaseModelSQLPipeline:
             "- joins, filters, and aggregations where needed\n\n"
             "---\n\n"
             "### OUTPUT FORMAT\n\n"
-            "Return ONLY the SQL query.\n"
-            "The answer must be a single executable SQLite query starting with SELECT or WITH.\n"
+            "Return ONLY a JSON object.\n"
+            "The sql field must be a single executable SQLite query starting with SELECT or WITH.\n"
+            "The reasoning field should briefly explain the choice.\n"
         )
 
     def _round_2_prompt(
@@ -692,6 +754,8 @@ class BaseModelSQLPipeline:
             "2. The user question\n"
             "3. The Round 1 draft SQL\n"
             "4. SQL examples selected based on structural similarity (SQL skeleton matching)\n\n"
+            "The database is SQLite, so use SQLite syntax.\n"
+            "Return a JSON object with exactly two keys: sql and reasoning.\n\n"
             "---\n\n"
             "## IMPORTANT PRINCIPLE\n\n"
             "Unlike Round 1, which relies on semantic and example-based generation,\n"
@@ -736,8 +800,9 @@ class BaseModelSQLPipeline:
             "- Prioritize structural correctness over lexical similarity\n\n"
             "---\n\n"
             "## OUTPUT FORMAT\n\n"
-            "Return ONLY the final SQL query.\n"
-            "The answer must be a single executable SQLite query starting with SELECT or WITH.\n"
+            "Return ONLY a JSON object.\n"
+            "The sql field must be a single executable SQLite query starting with SELECT or WITH.\n"
+            "The reasoning field should briefly explain the final choice.\n"
         )
 
     def validate_sql(
@@ -778,11 +843,12 @@ class BaseModelSQLPipeline:
         few_shot_examples = [item["example"] for item in question_retrieval_results]
         round_1_prompt = self._round_1_prompt(question, schema_json, few_shot_examples)
         print("[Stage 2.1] Generating Round 1 SQL...")
-        round_1_raw = self._generate_text(
+        round_1_response = self._generate_sql_response(
             round_1_prompt,
             max_new_tokens=self.round_1_max_new_tokens,
         )
-        round_1_sql = clean_sql_output(round_1_raw)
+        round_1_sql = round_1_response["sql"]
+        round_1_reasoning = round_1_response["reasoning"]
         print("[Stage 2.2] Validating Round 1 SQL...")
         round_1_validation = self.validate_sql(round_1_sql)
         validated_round_1_sql = round_1_validation["sql"]
@@ -803,17 +869,19 @@ class BaseModelSQLPipeline:
             structural_examples,
         )
         print("[Stage 2.4] Generating Round 2 refined SQL...")
-        round_2_raw = self._generate_text(
+        round_2_response = self._generate_sql_response(
             round_2_prompt,
             max_new_tokens=self.round_2_max_new_tokens,
         )
-        round_2_sql = clean_sql_output(round_2_raw)
+        round_2_sql = round_2_response["sql"]
+        round_2_reasoning = round_2_response["reasoning"]
         print("[Stage 2.5] Validating final SQL...")
         round_2_validation = self.validate_sql(round_2_sql)
 
         final_sql = round_2_validation["sql"] or validated_round_1_sql or round_1_sql
         final_validation = self.validate_sql(final_sql)
         final_sql = final_validation["sql"] or final_sql
+        final_reasoning = round_2_reasoning or round_1_reasoning
 
         return {
             "question": question,
@@ -821,12 +889,15 @@ class BaseModelSQLPipeline:
             "question_skeleton": question_skeleton,
             "question_retrieval_results": question_retrieval_results,
             "round_1_sql": round_1_sql,
+            "round_1_reasoning": round_1_reasoning,
             "round_1_sql_skeleton": round_1_sql_skeleton,
             "round_1_validation": round_1_validation,
             "structural_examples": structural_examples,
             "round_2_sql": round_2_sql,
+            "round_2_reasoning": round_2_reasoning,
             "round_2_validation": round_2_validation,
             "final_sql": final_sql,
+            "final_reasoning": final_reasoning,
             "final_valid": final_validation["valid"],
             "final_validation_error": final_validation["validation_error"],
         }
@@ -962,7 +1033,9 @@ class SQLEvaluator:
             db_stats[db_id]["total"] += 1
             start_time = time.time()
             current_round_1_sql = ""
+            current_round_1_reasoning = ""
             current_round_2_sql = ""
+            current_round_2_reasoning = ""
             current_round_1_valid = False
             current_round_2_valid = False
             current_final_valid = False
@@ -979,7 +1052,9 @@ class SQLEvaluator:
                 print(f"[Stage 2: Generation] Final SQL: {summarize_sql(generation['final_sql'])}")
 
                 current_round_1_sql = generation["round_1_sql"]
+                current_round_1_reasoning = generation["round_1_reasoning"]
                 current_round_2_sql = generation["round_2_sql"]
+                current_round_2_reasoning = generation["round_2_reasoning"]
                 current_round_1_valid = generation["round_1_validation"]["valid"]
                 current_round_2_valid = generation["round_2_validation"]["valid"]
                 current_final_valid = generation["final_valid"]
@@ -1019,7 +1094,9 @@ class SQLEvaluator:
                         "ground_truth_sql": ground_truth_sql,
                         "schema_linking_used": linked_schema_record is not None,
                         "round_1_sql": generation["round_1_sql"],
+                        "round_1_reasoning": generation["round_1_reasoning"],
                         "round_2_sql": generation["round_2_sql"],
+                        "round_2_reasoning": generation["round_2_reasoning"],
                         "execution_match": execution_match,
                         "valid": generation["final_valid"],
                         "validation_error": generation["final_validation_error"],
@@ -1035,8 +1112,11 @@ class SQLEvaluator:
                         difficulty=difficulty,
                         gold_sql=ground_truth_sql,
                         round_1_sql=current_round_1_sql,
+                        round_1_reasoning=current_round_1_reasoning,
                         round_2_sql=current_round_2_sql,
+                        round_2_reasoning=current_round_2_reasoning,
                         winner_sql=final_sql,
+                        winner_reasoning=generation["final_reasoning"],
                         is_correct=execution_match,
                         execution_times=[generated_exec_time],
                         generated_results=generated_results,
@@ -1080,8 +1160,11 @@ class SQLEvaluator:
                         difficulty=difficulty,
                         gold_sql=ground_truth_sql,
                         round_1_sql=current_round_1_sql,
+                        round_1_reasoning=current_round_1_reasoning,
                         round_2_sql=current_round_2_sql,
+                        round_2_reasoning=current_round_2_reasoning,
                         winner_sql="",
+                        winner_reasoning="",
                         is_correct=False,
                         execution_times=[execution_time],
                         generated_results=[],
