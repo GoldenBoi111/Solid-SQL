@@ -32,13 +32,6 @@ try:
 except ImportError:  # pragma: no cover - optional dependency on the execution machine
     outlines = None
 
-try:
-    from pydantic import BaseModel, Field, constr
-except ImportError:  # pragma: no cover - optional dependency on the execution machine
-    BaseModel = None
-    Field = None
-    constr = None
-
 from schema_linking.question_skeleton_extractor import SKELETON_EXTRACTION_PROMPT
 from schema_linking.skeleton_similarity import SkeletonSimilarity
 from schema_linking.sql_skeleton_extractor import SQLSkeletonExtractor
@@ -86,22 +79,6 @@ SQL:
 
 Skeleton SQL:"""
 
-if BaseModel is not None and constr is not None and Field is not None:
-    SqlString = constr(
-        pattern=r"(?is)^(?:WITH|SELECT)[\s\S]*FROM[\s\S]*$"
-    )
-
-    class SqlResponse(BaseModel):
-        sql: SqlString = Field(
-            description="A single executable SQLite query that starts with SELECT or WITH and contains a FROM clause."
-        )
-        reasoning: str = Field(description="Short explanation of how the SQL was derived.")
-else:  # pragma: no cover - fallback when pydantic is unavailable locally
-    class SqlResponse(object):
-        sql: str
-        reasoning: str
-
-
 def summarize_text(text: str, limit: int = 240) -> str:
     cleaned = " ".join((text or "").split())
     if len(cleaned) <= limit:
@@ -111,6 +88,54 @@ def summarize_text(text: str, limit: int = 240) -> str:
 
 def summarize_sql(sql: str, limit: int = 180) -> str:
     return summarize_text(sql, limit=limit)
+
+
+def parse_json_response(response: str) -> Optional[Dict[str, Any]]:
+    response = (response or "").strip()
+    if response.startswith("```json"):
+        response = response[7:]
+    elif response.startswith("```"):
+        response = response[3:]
+    if response.endswith("```"):
+        response = response[:-3].strip()
+
+    start_idx = response.find("{")
+    if start_idx == -1:
+        return None
+
+    brace_count = 0
+    end_idx = -1
+    in_string = False
+    escape_next = False
+
+    for index, char in enumerate(response[start_idx:], start_idx):
+        if escape_next:
+            escape_next = False
+            continue
+        if char == "\\" and in_string:
+            escape_next = True
+            continue
+        if char == '"' and not escape_next:
+            in_string = not in_string
+            continue
+        if not in_string:
+            if char == "{":
+                brace_count += 1
+            elif char == "}":
+                brace_count -= 1
+                if brace_count == 0:
+                    end_idx = index + 1
+                    break
+
+    if end_idx <= start_idx:
+        return None
+
+    json_str = response[start_idx:end_idx]
+    try:
+        parsed = json.loads(json_str)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        return None
 
 
 def load_schema_for_db(db_path: str) -> str:
@@ -258,6 +283,11 @@ def summarize_execution_difference(
             "generated_only_rows": [],
             "ground_truth_only_rows": [],
         }
+
+
+def is_cuda_device_assert(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "cuda error: device-side assert triggered" in message or "cudaerrorassert" in message
 
 
 def build_question_log_record(
@@ -597,10 +627,7 @@ class BaseModelSQLPipeline:
         if outlines is not None:
             try:
                 self._outlines_model = outlines.from_transformers(self._model, self._tokenizer)
-                if BaseModel is not None:
-                    print("[Setup] Outlines structured SQL generation enabled.")
-                else:
-                    print("[Setup] Outlines imported, but Pydantic is unavailable; using raw text fallback.")
+                print("[Setup] Outlines structured SQL generation enabled.")
             except Exception as exc:
                 self._outlines_model = None
                 print(f"[Setup] Outlines initialization failed; using raw text fallback. Reason: {exc}")
@@ -623,14 +650,18 @@ class BaseModelSQLPipeline:
 
     def _generate_text(self, prompt: str, max_new_tokens: int = 4096) -> str:
         self._load_model()
-        device = next(self._model.parameters()).device
+        device = getattr(self._model, "device", None)
+        if device is None:
+            device = next(self._model.parameters()).device
         inputs = self._tokenizer(
             [prompt],
             padding=True,
             truncation=True,
             max_length=self.max_seq_length,
             return_tensors="pt",
-        ).to(device)
+        )
+        if str(device).startswith("cuda"):
+            inputs = inputs.to(device)
 
         with torch.no_grad():
             outputs = self._model.generate(
@@ -649,19 +680,25 @@ class BaseModelSQLPipeline:
     def _generate_sql_response(self, prompt: str, max_new_tokens: int = 4096) -> Dict[str, str]:
         self._load_model()
 
-        if self._outlines_model is not None and BaseModel is not None:
+        if self._outlines_model is not None:
             try:
-                response = self._outlines_model(prompt, SqlResponse, max_new_tokens=max_new_tokens)
+                response = self._outlines_model(prompt, max_new_tokens=max_new_tokens)
+                if isinstance(response, str):
+                    parsed = parse_json_response(response)
+                    if parsed is not None:
+                        sql_text = clean_sql_output(str(parsed.get("sql", "")))
+                        reasoning_text = str(parsed.get("reasoning", "")).strip()
+                        return {"sql": sql_text, "reasoning": reasoning_text}
+                    return {"sql": clean_sql_output(response), "reasoning": ""}
                 if hasattr(response, "model_dump"):
                     response = response.model_dump()
-                elif isinstance(response, str):
-                    response = json.loads(response)
-                elif not isinstance(response, dict):
-                    response = dict(response)
-                sql_text = clean_sql_output(str(response.get("sql", "")))
-                reasoning_text = str(response.get("reasoning", "")).strip()
-                return {"sql": sql_text, "reasoning": reasoning_text}
+                if isinstance(response, dict):
+                    sql_text = clean_sql_output(str(response.get("sql", "")))
+                    reasoning_text = str(response.get("reasoning", "")).strip()
+                    return {"sql": sql_text, "reasoning": reasoning_text}
             except Exception as exc:
+                if is_cuda_device_assert(exc):
+                    raise
                 print(f"Warning: Outlines structured generation failed; falling back to raw text: {exc}")
 
         fallback_raw = self._generate_text(prompt, max_new_tokens=max_new_tokens)
@@ -1150,6 +1187,53 @@ class SQLEvaluator:
                 print(f"[Stage 5: Outcome] Execution time: {execution_time:.4f}s")
 
             except Exception as exc:
+                if is_cuda_device_assert(exc):
+                    execution_time = time.time() - start_time
+                    db_stats[db_id]["total_time"] += execution_time
+                    db_stats[db_id]["errors"] += 1
+                    traceback_text = traceback.format_exc()
+                    results.append(
+                        {
+                            "question_id": question_id,
+                            "db_id": db_id,
+                            "question": question,
+                            "difficulty": difficulty,
+                            "generated_sql": "",
+                            "ground_truth_sql": ground_truth_sql,
+                            "error": str(exc),
+                            "traceback": traceback_text,
+                            "execution_time": execution_time,
+                            "execution_match": False,
+                            "valid": False,
+                            "cuda_device_assert": True,
+                        }
+                    )
+                    if logs_dir:
+                        log_record = build_question_log_record(
+                            question_id=question_id,
+                            question=question,
+                            db_id=db_id,
+                            difficulty=difficulty,
+                            gold_sql=ground_truth_sql,
+                            round_1_sql=current_round_1_sql,
+                            round_1_reasoning=current_round_1_reasoning,
+                            round_2_sql=current_round_2_sql,
+                            round_2_reasoning=current_round_2_reasoning,
+                            winner_sql="",
+                            winner_reasoning="",
+                            is_correct=False,
+                            execution_times=[],
+                            generated_results=[],
+                            gold_results=[],
+                            round_1_valid=current_round_1_valid,
+                            round_2_valid=current_round_2_valid,
+                            final_valid=False,
+                            execution_error=str(exc),
+                        )
+                        question_logs.append(log_record)
+                        write_question_logs_array(logs_dir, question_logs)
+                    print(f"[Stage 5: Outcome] Fatal CUDA assert on question {question_id}; aborting worker.")
+                    raise
                 execution_time = time.time() - start_time
                 db_stats[db_id]["total_time"] += execution_time
                 db_stats[db_id]["errors"] += 1
