@@ -206,22 +206,57 @@ def compare_execution_results(
         return generated_results == ground_truth_results
 
 
+def summarize_execution_difference(
+    generated_results: List[Tuple],
+    ground_truth_results: List[Tuple],
+) -> Dict[str, Any]:
+    try:
+        generated_set = set(generated_results)
+        ground_truth_set = set(ground_truth_results)
+        shared_rows = sorted(generated_set & ground_truth_set)
+        generated_only = sorted(generated_set - ground_truth_set)
+        ground_truth_only = sorted(ground_truth_set - generated_set)
+        return {
+            "generated_row_count": len(generated_results),
+            "ground_truth_row_count": len(ground_truth_results),
+            "shared_rows": shared_rows,
+            "generated_only_rows": generated_only,
+            "ground_truth_only_rows": ground_truth_only,
+        }
+    except Exception:
+        return {
+            "generated_row_count": len(generated_results),
+            "ground_truth_row_count": len(ground_truth_results),
+            "shared_rows": [],
+            "generated_only_rows": [],
+            "ground_truth_only_rows": [],
+        }
+
+
 def build_question_log_record(
     *,
     question_id: Any,
     question: str,
     db_id: str,
     difficulty: str,
-    ground_truth_sql: str,
+    gold_sql: str,
+    round_1_sql: str,
+    round_2_sql: str,
     winner_sql: str,
     is_correct: bool,
     execution_times: List[float],
+    generated_results: List[Tuple],
+    gold_results: List[Tuple],
+    round_1_valid: bool,
+    round_2_valid: bool,
+    final_valid: bool,
     execution_error: Optional[str] = None,
 ) -> Dict[str, Any]:
     has_sql = bool((winner_sql or "").strip())
     valid_generation = int(has_sql)
     execution_errors = 1 if execution_error else 0
     unique_valid_sqls = 1 if has_sql else 0
+    execution_difference = summarize_execution_difference(generated_results, gold_results)
     alternatives = []
     if has_sql:
         best_exec_time = min(execution_times) if execution_times else None
@@ -240,11 +275,19 @@ def build_question_log_record(
         "question": question,
         "db_id": db_id,
         "difficulty": difficulty or "unknown",
-        "ground_truth": ground_truth_sql,
+        "gold_sql": gold_sql,
+        "ground_truth": gold_sql,
+        "round_1_sql": round_1_sql,
+        "round_2_sql": round_2_sql,
         "winner_sql": winner_sql,
+        "generated_sql": winner_sql,
         "is_correct": is_correct,
         "winner_confidence": 1.0 if has_sql else 0.0,
         "execution_times": execution_times,
+        "generated_results": generated_results,
+        "gold_results": gold_results,
+        "execution_difference": execution_difference,
+        "execution_error": execution_error,
         "high_confidence_alternatives": alternatives,
         "selection": {
             "selected_sql": winner_sql,
@@ -256,6 +299,9 @@ def build_question_log_record(
             "execution_errors": execution_errors,
             "valid_generations": valid_generation,
             "unique_valid_sqls": unique_valid_sqls,
+            "round_1_valid": int(round_1_valid),
+            "round_2_valid": int(round_2_valid),
+            "final_valid": int(final_valid),
         },
     }
 
@@ -851,13 +897,21 @@ class SQLEvaluator:
                                 question=question,
                                 db_id=db_id,
                                 difficulty=difficulty,
-                                ground_truth_sql=ground_truth_sql,
+                                gold_sql=ground_truth_sql,
+                                round_1_sql="",
+                                round_2_sql="",
                                 winner_sql="",
                                 is_correct=False,
                                 execution_times=[],
+                                generated_results=[],
+                                gold_results=[],
+                                round_1_valid=False,
+                                round_2_valid=False,
+                                final_valid=False,
                                 execution_error=f"Missing database file for {db_id}",
                             )
                         )
+                        write_question_logs_array(logs_dir, question_logs)
                     continue
 
             print("[Stage 1: Schema Load] Loading schema text...")
@@ -874,13 +928,21 @@ class SQLEvaluator:
                                 question=question,
                                 db_id=db_id,
                                 difficulty=difficulty,
-                                ground_truth_sql=ground_truth_sql,
+                                gold_sql=ground_truth_sql,
+                                round_1_sql="",
+                                round_2_sql="",
                                 winner_sql="",
                                 is_correct=False,
                                 execution_times=[],
+                                generated_results=[],
+                                gold_results=[],
+                                round_1_valid=False,
+                                round_2_valid=False,
+                                final_valid=False,
                                 execution_error=f"Schema load failed for {db_id}",
                             )
                         )
+                        write_question_logs_array(logs_dir, question_logs)
                     continue
                 db_cache[db_id] = {"schema": schema_text, "path": db_path}
                 print("[Stage 1: Schema Load] Loaded from SQLite and cached.")
@@ -899,6 +961,11 @@ class SQLEvaluator:
             )
             db_stats[db_id]["total"] += 1
             start_time = time.time()
+            current_round_1_sql = ""
+            current_round_2_sql = ""
+            current_round_1_valid = False
+            current_round_2_valid = False
+            current_final_valid = False
 
             try:
                 print("[Stage 2: Generation] Running base-model SQL pipeline...")
@@ -910,6 +977,12 @@ class SQLEvaluator:
                 print(f"[Stage 2: Generation] Round 1 SQL: {summarize_sql(generation['round_1_sql'])}")
                 print(f"[Stage 2: Generation] Round 2 SQL: {summarize_sql(generation['round_2_sql'])}")
                 print(f"[Stage 2: Generation] Final SQL: {summarize_sql(generation['final_sql'])}")
+
+                current_round_1_sql = generation["round_1_sql"]
+                current_round_2_sql = generation["round_2_sql"]
+                current_round_1_valid = generation["round_1_validation"]["valid"]
+                current_round_2_valid = generation["round_2_validation"]["valid"]
+                current_final_valid = generation["final_valid"]
 
                 final_sql = generation["final_sql"]
                 execution_time = time.time() - start_time
@@ -960,13 +1033,21 @@ class SQLEvaluator:
                         question=question,
                         db_id=db_id,
                         difficulty=difficulty,
-                        ground_truth_sql=ground_truth_sql,
+                        gold_sql=ground_truth_sql,
+                        round_1_sql=current_round_1_sql,
+                        round_2_sql=current_round_2_sql,
                         winner_sql=final_sql,
                         is_correct=execution_match,
                         execution_times=[generated_exec_time],
+                        generated_results=generated_results,
+                        gold_results=ground_truth_results,
+                        round_1_valid=current_round_1_valid,
+                        round_2_valid=current_round_2_valid,
+                        final_valid=current_final_valid,
                         execution_error=generated_exec_error,
                     )
                     question_logs.append(log_record)
+                    write_question_logs_array(logs_dir, question_logs)
                 print(f"[Stage 5: Outcome] Final status: {'correct' if execution_match else 'incorrect'}")
                 print(f"[Stage 5: Outcome] Passed validation: {generation['final_valid']}")
                 print(f"[Stage 5: Outcome] Execution time: {execution_time:.4f}s")
@@ -997,13 +1078,21 @@ class SQLEvaluator:
                         question=question,
                         db_id=db_id,
                         difficulty=difficulty,
-                        ground_truth_sql=ground_truth_sql,
+                        gold_sql=ground_truth_sql,
+                        round_1_sql=current_round_1_sql,
+                        round_2_sql=current_round_2_sql,
                         winner_sql="",
                         is_correct=False,
                         execution_times=[execution_time],
+                        generated_results=[],
+                        gold_results=[],
+                        round_1_valid=current_round_1_valid,
+                        round_2_valid=current_round_2_valid,
+                        final_valid=False,
                         execution_error=str(exc),
                     )
                     question_logs.append(log_record)
+                    write_question_logs_array(logs_dir, question_logs)
                 print(f"[Stage 5: Outcome] Error processing question {question_id}: {exc}")
                 print(traceback_text)
                 print(f"[Stage 5: Outcome] Execution time before failure: {execution_time:.4f}s")
@@ -1037,8 +1126,6 @@ class SQLEvaluator:
             "per_database_statistics": dict(db_stats),
             "detailed_results": results,
         }
-        if logs_dir:
-            write_question_logs_array(logs_dir, question_logs)
         Path(output_file).write_text(
             json.dumps(output_data, indent=2, ensure_ascii=False),
             encoding="utf-8",
