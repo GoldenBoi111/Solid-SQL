@@ -33,9 +33,11 @@ except ImportError:  # pragma: no cover - optional dependency on the execution m
     outlines = None
 
 try:
-    from pydantic import BaseModel
+    from pydantic import BaseModel, Field, constr
 except ImportError:  # pragma: no cover - optional dependency on the execution machine
     BaseModel = None
+    Field = None
+    constr = None
 
 from schema_linking.question_skeleton_extractor import SKELETON_EXTRACTION_PROMPT
 from schema_linking.skeleton_similarity import SkeletonSimilarity
@@ -84,9 +86,20 @@ SQL:
 
 Skeleton SQL:"""
 
-class SqlResponse(BaseModel if BaseModel is not None else object):
-    sql: str
-    reasoning: str
+if BaseModel is not None and constr is not None and Field is not None:
+    SqlString = constr(
+        pattern=r"(?is)^(?:WITH\b[\s\S]*?\bSELECT\b[\s\S]*?\bFROM\b[\s\S]*|SELECT\b[\s\S]*?\bFROM\b[\s\S]*)$"
+    )
+
+    class SqlResponse(BaseModel):
+        sql: SqlString = Field(
+            description="A single executable SQLite query that starts with SELECT or WITH and contains a FROM clause."
+        )
+        reasoning: str = Field(description="Short explanation of how the SQL was derived.")
+else:  # pragma: no cover - fallback when pydantic is unavailable locally
+    class SqlResponse(object):
+        sql: str
+        reasoning: str
 
 
 def summarize_text(text: str, limit: int = 240) -> str:
