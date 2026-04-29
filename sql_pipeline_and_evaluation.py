@@ -88,7 +88,7 @@ Skeleton SQL:"""
 
 if BaseModel is not None and constr is not None and Field is not None:
     SqlString = constr(
-        pattern=r"(?is)^(?:WITH\b[\s\S]*?\bSELECT\b[\s\S]*?\bFROM\b[\s\S]*|SELECT\b[\s\S]*?\bFROM\b[\s\S]*)$"
+        pattern=r"(?is)^(?:WITH|SELECT)[\s\S]*FROM[\s\S]*$"
     )
 
     class SqlResponse(BaseModel):
