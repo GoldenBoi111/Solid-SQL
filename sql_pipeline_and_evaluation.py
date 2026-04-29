@@ -262,27 +262,13 @@ def summarize_execution_difference(
     generated_results: List[Tuple],
     ground_truth_results: List[Tuple],
 ) -> Dict[str, Any]:
-    try:
-        generated_set = set(generated_results)
-        ground_truth_set = set(ground_truth_results)
-        shared_rows = sorted(generated_set & ground_truth_set)
-        generated_only = sorted(generated_set - ground_truth_set)
-        ground_truth_only = sorted(ground_truth_set - generated_set)
-        return {
-            "generated_row_count": len(generated_results),
-            "ground_truth_row_count": len(ground_truth_results),
-            "shared_rows": shared_rows,
-            "generated_only_rows": generated_only,
-            "ground_truth_only_rows": ground_truth_only,
-        }
-    except Exception:
-        return {
-            "generated_row_count": len(generated_results),
-            "ground_truth_row_count": len(ground_truth_results),
-            "shared_rows": [],
-            "generated_only_rows": [],
-            "ground_truth_only_rows": [],
-        }
+    generated_row_count = len(generated_results)
+    ground_truth_row_count = len(ground_truth_results)
+    return {
+        "generated_row_count": generated_row_count,
+        "ground_truth_row_count": ground_truth_row_count,
+        "row_count_difference": generated_row_count - ground_truth_row_count,
+    }
 
 
 def is_cuda_device_assert(exc: Exception) -> bool:
@@ -296,6 +282,7 @@ def build_question_log_record(
     question: str,
     db_id: str,
     difficulty: str,
+    evidence: str,
     gold_sql: str,
     round_1_sql: str,
     round_1_reasoning: str,
@@ -335,37 +322,21 @@ def build_question_log_record(
         "question": question,
         "db_id": db_id,
         "difficulty": difficulty or "unknown",
+        "evidence": evidence,
         "gold_sql": gold_sql,
-        "ground_truth": gold_sql,
         "round_1_sql": round_1_sql,
-        "round_1_reasoning": round_1_reasoning,
         "round_2_sql": round_2_sql,
-        "round_2_reasoning": round_2_reasoning,
-        "winner_sql": winner_sql,
-        "winner_reasoning": winner_reasoning,
         "generated_sql": winner_sql,
         "is_correct": is_correct,
         "winner_confidence": 1.0 if has_sql else 0.0,
         "execution_times": execution_times,
-        "generated_results": generated_results,
-        "gold_results": gold_results,
         "execution_difference": execution_difference,
         "execution_error": execution_error,
-        "high_confidence_alternatives": alternatives,
-        "selection": {
-            "selected_sql": winner_sql,
-            "selected_reasoning": winner_reasoning,
-            "reasoning": winner_reasoning if has_sql else "No valid SQL candidate generated",
-            "candidates_count": 1 if has_sql else 0,
-        },
         "metrics": {
             "generated": 1,
             "execution_errors": execution_errors,
             "valid_generations": valid_generation,
             "unique_valid_sqls": unique_valid_sqls,
-            "round_1_valid": int(round_1_valid),
-            "round_2_valid": int(round_2_valid),
-            "final_valid": int(final_valid),
         },
     }
 
@@ -722,8 +693,10 @@ class BaseModelSQLPipeline:
             response = response.split("\n")[0].strip()
         return response
 
-    def _extract_question_skeleton(self, question: str) -> str:
+    def _extract_question_skeleton(self, question: str, evidence: str = "") -> str:
         skeleton_prompt = SKELETON_EXTRACTION_PROMPT.format(question=question)
+        if evidence:
+            skeleton_prompt += "\n\nBENCHMARK EVIDENCE:\n" + evidence
         response = self._generate_text(skeleton_prompt, max_new_tokens=256)
         return self._clean_skeleton_response(response)
 
@@ -755,6 +728,7 @@ class BaseModelSQLPipeline:
     def _round_1_prompt(
         self,
         question: str,
+        evidence: str,
         schema_json: Dict[str, Any],
         few_shot_examples: List[Dict[str, str]],
     ) -> str:
@@ -776,6 +750,8 @@ class BaseModelSQLPipeline:
             "---\n\n"
             "### USER QUESTION\n"
             f"{question}\n\n"
+            "### BENCHMARK EVIDENCE\n"
+            f"{evidence or '(none provided)'}\n\n"
             "---\n\n"
             "### FEW-SHOT EXAMPLES\n"
             f"{self._format_few_shot_examples(few_shot_examples)}\n\n"
@@ -796,6 +772,7 @@ class BaseModelSQLPipeline:
     def _round_2_prompt(
         self,
         question: str,
+        evidence: str,
         schema_json: Dict[str, Any],
         round_1_sql: str,
         round_1_sql_skeleton: str,
@@ -824,6 +801,8 @@ class BaseModelSQLPipeline:
             "---\n\n"
             "## USER QUESTION\n"
             f"{question}\n\n"
+            "## BENCHMARK EVIDENCE\n"
+            f"{evidence or '(none provided)'}\n\n"
             "---\n\n"
             "## ROUND 1 DRAFT SQL\n"
             f"{round_1_sql}\n\n"
@@ -885,17 +864,18 @@ class BaseModelSQLPipeline:
     def generate_sql(
         self,
         question: str,
+        evidence: str,
         schema_json: Dict[str, Any],
         round_1_examples: int = 3,
         round_2_examples: int = 3,
     ) -> Dict[str, Any]:
-        question_skeleton = self._extract_question_skeleton(question)
+        question_skeleton = self._extract_question_skeleton(question, evidence=evidence)
         question_retrieval_results = self.retriever.retrieve_by_question(
             question_skeleton,
             top_n=round_1_examples,
         )
         few_shot_examples = [item["example"] for item in question_retrieval_results]
-        round_1_prompt = self._round_1_prompt(question, schema_json, few_shot_examples)
+        round_1_prompt = self._round_1_prompt(question, evidence, schema_json, few_shot_examples)
         print("[Stage 2.1] Generating Round 1 SQL...")
         round_1_response = self._generate_sql_response(
             round_1_prompt,
@@ -917,6 +897,7 @@ class BaseModelSQLPipeline:
         )
         round_2_prompt = self._round_2_prompt(
             question,
+            evidence,
             schema_json,
             validated_round_1_sql or round_1_sql,
             round_1_sql_skeleton,
@@ -939,6 +920,7 @@ class BaseModelSQLPipeline:
 
         return {
             "question": question,
+            "evidence": evidence,
             "schema_json": schema_json,
             "question_skeleton": question_skeleton,
             "question_retrieval_results": question_retrieval_results,
@@ -1001,6 +983,7 @@ class SQLEvaluator:
             question = item["question"]
             db_id = item["db_id"]
             difficulty = item.get("difficulty", "unknown")
+            evidence = item.get("evidence", "")
             ground_truth_sql = item.get("SQL", item.get("sql", ""))
 
             print("\n" + "-" * 80)
@@ -1022,6 +1005,7 @@ class SQLEvaluator:
                                 question=question,
                                 db_id=db_id,
                                 difficulty=difficulty,
+                                evidence=evidence,
                                 gold_sql=ground_truth_sql,
                                 round_1_sql="",
                                 round_2_sql="",
@@ -1053,6 +1037,7 @@ class SQLEvaluator:
                                 question=question,
                                 db_id=db_id,
                                 difficulty=difficulty,
+                                evidence=evidence,
                                 gold_sql=ground_truth_sql,
                                 round_1_sql="",
                                 round_2_sql="",
@@ -1098,6 +1083,7 @@ class SQLEvaluator:
                 print("[Stage 2: Generation] Running base-model SQL pipeline...")
                 generation = self.pipeline.generate_sql(
                     question=question,
+                    evidence=evidence,
                     schema_json=schema_json,
                 )
                 print("[Stage 2: Generation] Pipeline output received.")
@@ -1143,6 +1129,7 @@ class SQLEvaluator:
                         "question_id": question_id,
                         "db_id": db_id,
                         "question": question,
+                        "evidence": evidence,
                         "difficulty": difficulty,
                         "generated_sql": final_sql,
                         "ground_truth_sql": ground_truth_sql,
@@ -1164,6 +1151,7 @@ class SQLEvaluator:
                         question=question,
                         db_id=db_id,
                         difficulty=difficulty,
+                        evidence=evidence,
                         gold_sql=ground_truth_sql,
                         round_1_sql=current_round_1_sql,
                         round_1_reasoning=current_round_1_reasoning,
@@ -1197,6 +1185,7 @@ class SQLEvaluator:
                             "question_id": question_id,
                             "db_id": db_id,
                             "question": question,
+                            "evidence": evidence,
                             "difficulty": difficulty,
                             "generated_sql": "",
                             "ground_truth_sql": ground_truth_sql,
@@ -1243,6 +1232,7 @@ class SQLEvaluator:
                         "question_id": question_id,
                         "db_id": db_id,
                         "question": question,
+                        "evidence": evidence,
                         "difficulty": difficulty,
                         "generated_sql": "",
                         "ground_truth_sql": ground_truth_sql,
@@ -1259,6 +1249,7 @@ class SQLEvaluator:
                         question=question,
                         db_id=db_id,
                         difficulty=difficulty,
+                        evidence=evidence,
                         gold_sql=ground_truth_sql,
                         round_1_sql=current_round_1_sql,
                         round_1_reasoning=current_round_1_reasoning,
