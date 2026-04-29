@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import sqlglot
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -266,17 +265,6 @@ def write_question_logs_array(logs_dir: str, payloads: List[Dict[str, Any]]) -> 
     path.mkdir(parents=True, exist_ok=True)
     log_path = path / "all_outputs.json"
     log_path.write_text(json.dumps(payloads, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-def parse_sql(sql: str, dialect: str = "sqlite") -> Tuple[bool, Optional[str], Optional[str]]:
-    try:
-        parsed = sqlglot.parse_one(sql, dialect=dialect)
-        normalized = parsed.sql(dialect=dialect)
-        return True, normalized, None
-    except sqlglot.errors.ParseError as exc:
-        return False, None, str(exc)
-    except RecursionError as exc:
-        return False, None, f"RecursionError during SQL parsing: {exc}"
 
 
 def clean_sql_output(sql: str) -> str:
@@ -714,24 +702,19 @@ class BaseModelSQLPipeline:
         if not cleaned_sql:
             return {
                 "sql": "",
-                "parsed": False,
-                "normalized_sql": None,
-                "parse_error": "Empty SQL after cleanup",
+                "valid": False,
+                "validation_error": "Empty SQL after cleanup",
             }
-        parsed_ok, normalized_sql, parse_error = parse_sql(cleaned_sql, dialect=self.sql_dialect)
-
-        if parsed_ok:
+        if not cleaned_sql.upper().startswith(("SELECT", "WITH")):
             return {
-                "sql": cleaned_sql,
-                "parsed": True,
-                "normalized_sql": normalized_sql,
-                "parse_error": None,
+                "sql": "",
+                "valid": False,
+                "validation_error": "SQL must start with SELECT or WITH",
             }
         return {
             "sql": cleaned_sql,
-            "parsed": False,
-            "normalized_sql": None,
-            "parse_error": parse_error,
+            "valid": True,
+            "validation_error": None,
         }
 
     def generate_sql(
@@ -783,7 +766,8 @@ class BaseModelSQLPipeline:
         round_2_validation = self.validate_sql(round_2_sql)
 
         final_sql = round_2_validation["sql"] or validated_round_1_sql or round_1_sql
-        final_parse_ok, final_normalized, final_parse_error = parse_sql(final_sql, dialect=self.sql_dialect)
+        final_validation = self.validate_sql(final_sql)
+        final_sql = final_validation["sql"] or final_sql
 
         return {
             "question": question,
@@ -797,9 +781,8 @@ class BaseModelSQLPipeline:
             "round_2_sql": round_2_sql,
             "round_2_validation": round_2_validation,
             "final_sql": final_sql,
-            "final_parsed": final_parse_ok,
-            "final_normalized_sql": final_normalized,
-            "final_parse_error": final_parse_error,
+            "final_valid": final_validation["valid"],
+            "final_validation_error": final_validation["validation_error"],
         }
 
     def shutdown(self) -> None:
@@ -832,7 +815,7 @@ class SQLEvaluator:
             lambda: {
                 "total": 0,
                 "correct": 0,
-                "parsed": 0,
+                "valid": 0,
                 "executed": 0,
                 "errors": 0,
                 "total_time": 0.0,
@@ -932,8 +915,8 @@ class SQLEvaluator:
                 execution_time = time.time() - start_time
                 db_stats[db_id]["total_time"] += execution_time
 
-                if generation["final_parsed"]:
-                    db_stats[db_id]["parsed"] += 1
+                if generation["final_valid"]:
+                    db_stats[db_id]["valid"] += 1
 
                 print("[Stage 3: Execution] Running generated SQL against SQLite...")
                 generated_results, generated_exec_time, generated_exec_error = execute_sql_with_metadata(db_path, final_sql)
@@ -949,9 +932,9 @@ class SQLEvaluator:
                 print("[Stage 4: Comparison] Comparing execution results...")
                 if execution_match:
                     db_stats[db_id]["correct"] += 1
-                    print("[Stage 4: Comparison] Execution result: MATCH")
+                    print("[Stage 4: Comparison] Execution result: correct")
                 else:
-                    print("[Stage 4: Comparison] Execution result: MISMATCH")
+                    print("[Stage 4: Comparison] Execution result: incorrect")
 
                 results.append(
                     {
@@ -965,8 +948,8 @@ class SQLEvaluator:
                         "round_1_sql": generation["round_1_sql"],
                         "round_2_sql": generation["round_2_sql"],
                         "execution_match": execution_match,
-                        "parsed": generation["final_parsed"],
-                        "parse_error": generation["final_parse_error"],
+                        "valid": generation["final_valid"],
+                        "validation_error": generation["final_validation_error"],
                         "execution_time": execution_time,
                         "retrieved_examples": len(generation["structural_examples"]),
                     }
@@ -985,7 +968,7 @@ class SQLEvaluator:
                     )
                     question_logs.append(log_record)
                 print(f"[Stage 5: Outcome] Final status: {'correct' if execution_match else 'incorrect'}")
-                print(f"[Stage 5: Outcome] Parsed successfully: {generation['final_parsed']}")
+                print(f"[Stage 5: Outcome] Passed validation: {generation['final_valid']}")
                 print(f"[Stage 5: Outcome] Execution time: {execution_time:.4f}s")
 
             except Exception as exc:
@@ -1005,7 +988,7 @@ class SQLEvaluator:
                         "traceback": traceback_text,
                         "execution_time": execution_time,
                         "execution_match": False,
-                        "parsed": False,
+                        "valid": False,
                     }
                 )
                 if logs_dir:
@@ -1030,7 +1013,7 @@ class SQLEvaluator:
             "processed_questions": sum(stats["total"] for stats in db_stats.values()),
             "correct_answers": sum(stats["correct"] for stats in db_stats.values()),
             "executed_queries": sum(stats["executed"] for stats in db_stats.values()),
-            "parsed_queries": sum(stats["parsed"] for stats in db_stats.values()),
+            "valid_queries": sum(stats["valid"] for stats in db_stats.values()),
             "errors": sum(stats["errors"] for stats in db_stats.values()),
             "average_execution_time": (
                 sum(stats["total_time"] for stats in db_stats.values())
@@ -1040,13 +1023,13 @@ class SQLEvaluator:
         overall_stats["execution_accuracy"] = (
             overall_stats["correct_answers"] / max(overall_stats["executed_queries"], 1)
         )
-        overall_stats["parsing_success_rate"] = (
-            overall_stats["parsed_queries"] / max(overall_stats["processed_questions"], 1)
+        overall_stats["validation_success_rate"] = (
+            overall_stats["valid_queries"] / max(overall_stats["processed_questions"], 1)
         )
 
         for db_id, stats in db_stats.items():
             stats["accuracy"] = stats["correct"] / max(stats["executed"], 1)
-            stats["parsing_success_rate"] = stats["parsed"] / max(stats["total"], 1)
+            stats["validation_success_rate"] = stats["valid"] / max(stats["total"], 1)
             stats["average_execution_time"] = stats["total_time"] / max(stats["total"], 1)
 
         output_data = {
@@ -1072,10 +1055,10 @@ def print_summary(stats: Dict[str, Any]) -> None:
     print(f"Processed questions: {overall['processed_questions']}")
     print(f"Executed queries: {overall['executed_queries']}")
     print(f"Correct answers: {overall['correct_answers']}")
-    print(f"Parsed queries: {overall['parsed_queries']}")
+    print(f"Valid queries: {overall['valid_queries']}")
     print(f"Errors: {overall['errors']}")
     print(f"Execution accuracy: {overall['execution_accuracy']:.4f}")
-    print(f"Parsing success rate: {overall['parsing_success_rate']:.4f}")
+    print(f"Validation success rate: {overall['validation_success_rate']:.4f}")
     print(f"Average execution time: {overall['average_execution_time']:.4f}s")
 
     print("\nPer-database statistics:")
@@ -1083,7 +1066,7 @@ def print_summary(stats: Dict[str, Any]) -> None:
         print(f"  {db_id}:")
         print(f"    Questions: {db_stats['total']}")
         print(f"    Execution accuracy: {db_stats['accuracy']:.4f}")
-        print(f"    Parsing success rate: {db_stats['parsing_success_rate']:.4f}")
+        print(f"    Validation success rate: {db_stats['validation_success_rate']:.4f}")
         print(f"    Average time: {db_stats['average_execution_time']:.4f}s")
 
 
@@ -1106,7 +1089,7 @@ def merge_shard_outputs(
         lambda: {
             "total": 0,
             "correct": 0,
-            "parsed": 0,
+            "valid": 0,
             "executed": 0,
             "errors": 0,
             "total_time": 0.0,
@@ -1119,7 +1102,7 @@ def merge_shard_outputs(
             target = merged_db_stats[db_id]
             target["total"] += stats.get("total", 0)
             target["correct"] += stats.get("correct", 0)
-            target["parsed"] += stats.get("parsed", 0)
+            target["valid"] += stats.get("valid", 0)
             target["executed"] += stats.get("executed", 0)
             target["errors"] += stats.get("errors", 0)
             target["total_time"] += stats.get("total_time", 0.0)
@@ -1132,7 +1115,7 @@ def merge_shard_outputs(
         "processed_questions": sum(stats["total"] for stats in merged_db_stats.values()),
         "correct_answers": sum(stats["correct"] for stats in merged_db_stats.values()),
         "executed_queries": sum(stats["executed"] for stats in merged_db_stats.values()),
-        "parsed_queries": sum(stats["parsed"] for stats in merged_db_stats.values()),
+        "valid_queries": sum(stats["valid"] for stats in merged_db_stats.values()),
         "errors": sum(stats["errors"] for stats in merged_db_stats.values()),
         "average_execution_time": (
             sum(stats["total_time"] for stats in merged_db_stats.values())
@@ -1142,13 +1125,13 @@ def merge_shard_outputs(
     overall_stats["execution_accuracy"] = (
         overall_stats["correct_answers"] / max(overall_stats["executed_queries"], 1)
     )
-    overall_stats["parsing_success_rate"] = (
-        overall_stats["parsed_queries"] / max(overall_stats["processed_questions"], 1)
+    overall_stats["validation_success_rate"] = (
+        overall_stats["valid_queries"] / max(overall_stats["processed_questions"], 1)
     )
 
     for db_id, stats in merged_db_stats.items():
         stats["accuracy"] = stats["correct"] / max(stats["executed"], 1)
-        stats["parsing_success_rate"] = stats["parsed"] / max(stats["total"], 1)
+        stats["validation_success_rate"] = stats["valid"] / max(stats["total"], 1)
         stats["average_execution_time"] = stats["total_time"] / max(stats["total"], 1)
 
     return {
