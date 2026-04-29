@@ -16,6 +16,7 @@ import json
 import os
 import sqlite3
 import time
+import traceback
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -344,6 +345,7 @@ class BaseModelSQLPipeline:
         )
         if self._tokenizer.pad_token is None:
             self._tokenizer.pad_token = self._tokenizer.eos_token
+        self._model.generation_config.use_cache = False
         self._model.eval()
 
     def load_structural_index(self, metadata_path: str, sql_index_path: Optional[str] = None) -> None:
@@ -366,6 +368,7 @@ class BaseModelSQLPipeline:
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
+                use_cache=False,
                 pad_token_id=self._tokenizer.pad_token_id,
                 eos_token_id=self._tokenizer.eos_token_id,
             )
@@ -761,6 +764,7 @@ class SQLEvaluator:
                 execution_time = time.time() - start_time
                 db_stats[db_id]["total_time"] += execution_time
                 db_stats[db_id]["errors"] += 1
+                traceback_text = traceback.format_exc()
                 results.append(
                     {
                         "question_id": question_id,
@@ -769,6 +773,7 @@ class SQLEvaluator:
                         "generated_sql": "",
                         "ground_truth_sql": ground_truth_sql,
                         "error": str(exc),
+                        "traceback": traceback_text,
                         "execution_time": execution_time,
                         "execution_match": False,
                         "exact_match": False,
@@ -776,6 +781,7 @@ class SQLEvaluator:
                     }
                 )
                 print(f"[Stage 5: Outcome] Error processing question {question_id}: {exc}")
+                print(traceback_text)
                 print(f"[Stage 5: Outcome] Execution time before failure: {execution_time:.4f}s")
 
         overall_stats = {
