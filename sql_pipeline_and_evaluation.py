@@ -38,6 +38,42 @@ except ImportError:
     FAISS_AVAILABLE = False
 
 
+SQL_SKELETON_EXTRACTION_PROMPT = """Given a SQL query, extract its structural skeleton by replacing schema-specific details and literal values while preserving the overall SQL structure.
+
+The skeleton (S*) should preserve:
+- SQL keywords and clause order
+- Join structure
+- Aggregation structure
+- Filter/operator structure
+- Grouping and ordering structure
+
+Replace:
+- Table names with [TABLE]
+- Column names with [COLUMN]
+- Literal values with [VALUE]
+
+Rules:
+- Return ONLY the skeleton SQL
+- Do NOT explain anything
+- Keep the SQL structure intact
+
+Examples:
+Input:
+SELECT COUNT(*) FROM Singer WHERE Age > 20
+Output:
+SELECT COUNT(*) FROM [TABLE] WHERE [COLUMN] > [VALUE]
+
+Input:
+SELECT T1.CustomerID FROM customers AS T1 INNER JOIN yearmonth AS T2 ON T1.CustomerID = T2.CustomerID WHERE T1.Segment = 'LAM' AND SUBSTR(T2.Date, 1, 4) = '2012' GROUP BY T1.CustomerID ORDER BY AVG(T2.Consumption) ASC LIMIT 1
+Output:
+SELECT [COLUMN] FROM [TABLE] AS T1 INNER JOIN [TABLE] AS T2 ON [COLUMN] = [COLUMN] WHERE [COLUMN] = [VALUE] AND SUBSTR([COLUMN], [VALUE], [VALUE]) = [VALUE] GROUP BY [COLUMN] ORDER BY AVG([COLUMN]) ASC LIMIT [VALUE]
+
+SQL:
+{sql}
+
+Skeleton SQL:"""
+
+
 def summarize_text(text: str, limit: int = 240) -> str:
     cleaned = " ".join((text or "").split())
     if len(cleaned) <= limit:
@@ -331,11 +367,9 @@ class SolidSQLRetriever:
             for index, score in indexed
         ]
 
-    def retrieve(self, sql: str, top_n: int = 3) -> List[Dict[str, Any]]:
+    def retrieve_by_sql_skeleton(self, target_skeleton: str, top_n: int = 3) -> List[Dict[str, Any]]:
         if not self.candidates:
             return []
-
-        target_skeleton = self.sql_extractor.extract(sql)
 
         if FAISS_AVAILABLE and self.sql_index is not None and self.sql_skeletons:
             embedding = self.similarity.get_sql_embeddings([target_skeleton])[0]
@@ -468,6 +502,11 @@ class BaseModelSQLPipeline:
         response = self._generate_text(skeleton_prompt, max_new_tokens=256)
         return self._clean_skeleton_response(response)
 
+    def _extract_sql_skeleton(self, sql: str) -> str:
+        skeleton_prompt = SQL_SKELETON_EXTRACTION_PROMPT.format(sql=sql)
+        response = self._generate_text(skeleton_prompt, max_new_tokens=256)
+        return self._clean_skeleton_response(response)
+
     def _format_few_shot_examples(self, examples: List[Dict[str, str]]) -> str:
         if not examples:
             return "(none provided)"
@@ -532,9 +571,9 @@ class BaseModelSQLPipeline:
         question: str,
         schema_json: Dict[str, Any],
         round_1_sql: str,
+        round_1_sql_skeleton: str,
         structural_examples: List[Dict[str, Any]],
     ) -> str:
-        sql_skeleton = self.sql_extractor.extract(round_1_sql)
         return (
             "You are a structure-aware text-to-SQL system.\n\n"
             "Your task is to generate the FINAL SQL query using:\n"
@@ -561,7 +600,7 @@ class BaseModelSQLPipeline:
             f"{round_1_sql}\n\n"
             "---\n\n"
             "## SQL SKELETON OF ROUND 1 SQL\n"
-            f"{sql_skeleton}\n\n"
+            f"{round_1_sql_skeleton}\n\n"
             "---\n\n"
             "## STRUCTURALLY SIMILAR SQL EXAMPLES\n"
             "These examples were retrieved using SQL skeleton edit distance (not text similarity):\n\n"
@@ -642,15 +681,19 @@ class BaseModelSQLPipeline:
         round_1_validation = self.validate_sql(round_1_sql)
         validated_round_1_sql = round_1_validation["sql"]
 
+        print("[Stage 2.2b] Generating SQL skeleton for Round 1 draft...")
+        round_1_sql_skeleton = self._extract_sql_skeleton(validated_round_1_sql or round_1_sql)
+
         print("[Stage 2.3] Retrieving structurally similar SQL examples...")
-        structural_examples = self.retriever.retrieve(
-            validated_round_1_sql or round_1_sql,
+        structural_examples = self.retriever.retrieve_by_sql_skeleton(
+            round_1_sql_skeleton,
             top_n=round_2_examples,
         )
         round_2_prompt = self._round_2_prompt(
             question,
             schema_json,
             validated_round_1_sql or round_1_sql,
+            round_1_sql_skeleton,
             structural_examples,
         )
         print("[Stage 2.4] Generating Round 2 refined SQL...")
@@ -671,6 +714,7 @@ class BaseModelSQLPipeline:
             "question_skeleton": question_skeleton,
             "question_retrieval_results": question_retrieval_results,
             "round_1_sql": round_1_sql,
+            "round_1_sql_skeleton": round_1_sql_skeleton,
             "round_1_validation": round_1_validation,
             "structural_examples": structural_examples,
             "round_2_sql": round_2_sql,
