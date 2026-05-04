@@ -34,6 +34,7 @@ def build_reasoning_column(col: str, question: str, sql: str) -> str:
 
 def build_training_example(
     question: str,
+    evidence: str,
     schema_text: str,
     tables: set,
     columns: set,
@@ -42,11 +43,12 @@ def build_training_example(
     """
     Create a single training example in instruction format.
 
-    Input: Question + Schema text
+    Input: Question + optional evidence + Schema text
     Output: Structured JSON with tables list and columns list, each with reasoning
     """
     input_text = INSTRUCTION_TEMPLATE.format(
-        question=question,
+        question=question.strip(),
+        evidence_block=evidence.strip() if evidence.strip() else "(none provided)",
         schema_text=schema_text,
     )
 
@@ -125,8 +127,11 @@ def process_dataset(
 
     for i, example in enumerate(examples):
         question = example.get("question", "")
-        sql = example.get("query", example.get("SQL", ""))
+        evidence = example.get("evidence", "")
+        sql = example.get("query", example.get("SQL", example.get("sql", "")))
         db_id = example.get("db_id", "")
+        question_id = example.get("question_id", i)
+        difficulty = example.get("difficulty", "unknown")
 
         if not question or not sql:
             skipped += 1
@@ -151,8 +156,11 @@ def process_dataset(
             continue
 
         # Build training example
-        entry = build_training_example(question, schema_text, tables, columns, sql)
+        entry = build_training_example(question, evidence, schema_text, tables, columns, sql)
         entry["db_id"] = db_id  # Keep for reference
+        entry["question_id"] = question_id
+        entry["difficulty"] = difficulty
+        entry["evidence"] = evidence
         training_data.append(entry)
 
     print(f"Processed {len(training_data)} examples, skipped {skipped}")
@@ -184,6 +192,9 @@ def save_jsonl(data: List[Dict], output_path: str) -> None:
                 "input": entry["input"],
                 "output": entry["output"],
                 "db_id": entry.get("db_id", ""),
+                "question_id": entry.get("question_id", ""),
+                "difficulty": entry.get("difficulty", "unknown"),
+                "evidence": entry.get("evidence", ""),
             }
             f.write(json.dumps(clean, ensure_ascii=False) + "\n")
     print(f"Saved {len(data)} entries to {output_path}")

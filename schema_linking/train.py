@@ -13,6 +13,7 @@ Uses:
 """
 
 import json
+import argparse
 from pathlib import Path
 from typing import List, Dict
 
@@ -140,8 +141,9 @@ def apply_lora(model):
 class SchemaLinkingTrainer:
     """Encapsulates the training pipeline."""
 
-    def __init__(self, output_dir: str = OUTPUT_DIR):
+    def __init__(self, output_dir: str = OUTPUT_DIR, base_model: str = MODEL_NAME):
         self.output_dir = output_dir
+        self.base_model = base_model
 
     def prepare_dataset(self, train_path: str, val_path: str, tokenizer):
         """Load and tokenize train/val datasets."""
@@ -227,7 +229,7 @@ class SchemaLinkingTrainer:
 
         # Save training config for reproducibility
         config_snapshot = {
-            "base_model": MODEL_NAME,
+            "base_model": self.base_model,
             "lora_r": LORA_R,
             "lora_alpha": LORA_ALPHA,
             "lora_dropout": LORA_DROPOUT,
@@ -253,7 +255,7 @@ class SchemaLinkingTrainer:
         print("=" * 60)
 
         # Load model
-        model, tokenizer = load_model(MODEL_NAME)
+        model, tokenizer = load_model(self.base_model)
 
         # Apply LoRA
         model = apply_lora(model)
@@ -284,8 +286,15 @@ class SchemaLinkingTrainer:
 
 
 def main():
-    trainer = SchemaLinkingTrainer()
-    trainer.train()
+    parser = argparse.ArgumentParser(description="Train the schema-linking LoRA adapter")
+    parser.add_argument("--train-path", default=OUTPUT_TRAIN_PATH, help="Path to the training JSONL file")
+    parser.add_argument("--val-path", default=OUTPUT_VAL_PATH, help="Path to the validation JSONL file")
+    parser.add_argument("--output-dir", default=OUTPUT_DIR, help="Directory for trained adapter outputs")
+    parser.add_argument("--base-model", default=MODEL_NAME, help="Base model name or local path")
+    args = parser.parse_args()
+
+    trainer = SchemaLinkingTrainer(output_dir=args.output_dir, base_model=args.base_model)
+    trainer.train(train_path=args.train_path, val_path=args.val_path)
 
 
 if __name__ == "__main__":

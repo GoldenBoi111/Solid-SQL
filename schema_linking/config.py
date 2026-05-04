@@ -45,7 +45,7 @@ SQL_DIALECT = "sqlite"
 # Prompt Templates
 # ============================================================
 INSTRUCTION_TEMPLATE = (
-    "You are a schema linking system for text-to-SQL.\n\n"
+    "You are a schema linking system for Spider-style text-to-SQL.\n\n"
     "Your task is to identify which parts of the database schema are relevant to the user question.\n\n"
     "You must map:\n"
     "- Entities in the question -> tables\n"
@@ -62,6 +62,16 @@ INSTRUCTION_TEMPLATE = (
     "---\n\n"
     "## USER QUESTION\n"
     "{question}\n\n"
+
+    "## BENCHMARK EVIDENCE\n"
+    "{evidence_block}\n\n"
+
+    "---\n\n"
+    "## SPIDER CONTEXT\n"
+    "- The question comes from a Spider-style benchmark example.\n"
+    "- Use the evidence if it is provided.\n"
+    "- Focus only on schema grounding, not SQL generation.\n\n"
+
     "---\n\n"
     "## TASK\n\n"
     "Step 1:\n"
@@ -72,6 +82,7 @@ INSTRUCTION_TEMPLATE = (
     "Identify any join paths or relationships between tables that are implied by the question.\n\n"
     "Step 4:\n"
     "Detect key entities, filters, and constraints (e.g., dates, categories, numeric conditions).\n\n"
+
     "---\n\n"
     "## OUTPUT FORMAT\n\n"
     "Return in this structured format:\n\n"

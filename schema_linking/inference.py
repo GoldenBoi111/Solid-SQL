@@ -279,10 +279,11 @@ class SchemaLinker:
             self._lora_active = False
             print("LoRA adapter disabled (kept in memory).")
 
-    def _format_prompt(self, question: str, schema_text: str) -> str:
+    def _format_prompt(self, question: str, schema_text: str, evidence: str = "") -> str:
         """Format the input prompt using the instruction template."""
         return INSTRUCTION_TEMPLATE.format(
             question=question,
+            evidence_block=evidence.strip() if evidence.strip() else "(none provided)",
             schema_text=schema_text,
         )
 
@@ -290,6 +291,7 @@ class SchemaLinker:
         self,
         question: str,
         schema_text: str,
+        evidence: str = "",
         max_new_tokens: int = 4096,
     ) -> Dict:
         """
@@ -298,7 +300,7 @@ class SchemaLinker:
         Loads the LoRA adapter, generates, then unloads it.
         """
         results = self.predict_batch(
-            [{"question": question, "schema_text": schema_text}],
+            [{"question": question, "schema_text": schema_text, "evidence": evidence}],
             max_new_tokens=max_new_tokens,
         )
         return results[0] if results else {}
@@ -323,7 +325,7 @@ class SchemaLinker:
 
         # Format all prompts
         prompts = [
-            self._format_prompt(item["question"], item["schema_text"])
+            self._format_prompt(item["question"], item["schema_text"], item.get("evidence", ""))
             for item in inputs
         ]
 
@@ -443,6 +445,7 @@ class SchemaLinker:
         question: str,
         db_id: str,
         db_root: str,
+        evidence: str = "",
         max_new_tokens: int = 4096,
     ) -> Dict:
         """
@@ -453,7 +456,7 @@ class SchemaLinker:
 
         if schema:
             schema_text = format_schema_compact(schema)
-            return self.predict(question, schema_text, max_new_tokens)
+            return self.predict(question, schema_text, evidence=evidence, max_new_tokens=max_new_tokens)
 
         db_path = Path(db_root) / f"{db_id}.sqlite"
         if not db_path.exists():
@@ -476,4 +479,4 @@ class SchemaLinker:
         schema_text = "\n".join(parts)
         conn.close()
 
-        return self.predict(question, schema_text, max_new_tokens)
+        return self.predict(question, schema_text, evidence=evidence, max_new_tokens=max_new_tokens)

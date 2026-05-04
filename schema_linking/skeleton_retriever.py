@@ -519,6 +519,8 @@ def load_candidate_library_from_json(path: str) -> List[Dict[str, str]]:
             entry["question"] = entry.pop("Question")
         if "SQL" in entry:
             entry["sql"] = entry.pop("SQL")
+        if "query" in entry and "sql" not in entry:
+            entry["sql"] = entry.pop("query")
         # Validate format
         if "question" not in entry or "sql" not in entry:
             raise ValueError(
@@ -551,8 +553,11 @@ def load_candidate_library_from_spider(
         candidates.append(
             {
                 "question": entry.get("question", ""),
-                "sql": entry.get("query", ""),
+                "sql": entry.get("SQL", entry.get("query", entry.get("sql", ""))),
                 "db_id": entry.get("db_id", ""),
+                "question_id": entry.get("question_id", ""),
+                "difficulty": entry.get("difficulty", "unknown"),
+                "evidence": entry.get("evidence", ""),
             }
         )
         if max_examples and len(candidates) >= max_examples:
