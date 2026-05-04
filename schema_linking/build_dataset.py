@@ -14,6 +14,9 @@ import random
 from pathlib import Path
 from typing import List, Dict, Tuple
 
+import sqlglot
+from sqlglot import exp
+
 from sql_parser import extract_schema_labels
 from schema_formatter import format_schema_compact, load_schemas_from_dir, load_schema_from_sqlite
 from config import (
@@ -30,6 +33,61 @@ def build_reasoning_table(table: str, question: str, sql: str) -> str:
 def build_reasoning_column(col: str, question: str, sql: str) -> str:
     """Generate a brief reasoning string for why a column is relevant."""
     return f"Referenced in the query to answer: {question[:80]}"
+
+
+def _resolve_table_name(table_expr: exp.Table) -> str:
+    return table_expr.name
+
+
+def extract_join_relationships(sql: str, dialect: str) -> List[str]:
+    try:
+        parsed = sqlglot.parse_one(sql, dialect=dialect)
+    except sqlglot.errors.ParseError:
+        return []
+
+    joins: List[str] = []
+    for join in parsed.find_all(exp.Join):
+        left_table = join.parent and getattr(join.parent, "this", None)
+        join_table = join.this
+        on_expr = join.args.get("on")
+        if join_table is None or on_expr is None:
+            continue
+
+        join_table_name = _resolve_table_name(join_table) if isinstance(join_table, exp.Table) else str(join_table)
+        left_name = _resolve_table_name(left_table) if isinstance(left_table, exp.Table) else ""
+        on_sql = on_expr.sql(dialect=dialect)
+        if left_name:
+            joins.append(f"{left_name} <-> {join_table_name} ON {on_sql}")
+        else:
+            joins.append(f"{join_table_name} ON {on_sql}")
+
+    return sorted(set(joins))
+
+
+def extract_filters(sql: str, dialect: str) -> List[str]:
+    try:
+        parsed = sqlglot.parse_one(sql, dialect=dialect)
+    except sqlglot.errors.ParseError:
+        return []
+
+    filters: List[str] = []
+    for where in parsed.find_all(exp.Where):
+        condition = where.this.sql(dialect=dialect).strip()
+        if condition:
+            filters.append(condition)
+    for having in parsed.find_all(exp.Having):
+        condition = having.this.sql(dialect=dialect).strip()
+        if condition:
+            filters.append(condition)
+
+    return sorted(set(filters))
+
+
+def extract_intent(question: str, sql: str) -> str:
+    question_text = question.strip()
+    if question_text:
+        return question_text[:200]
+    return "Spider-style schema linking"
 
 
 def build_training_example(
@@ -52,20 +110,64 @@ def build_training_example(
         schema_text=schema_text,
     )
 
-    # Build structured output
+    relevant_tables = sorted(tables)
+    relevant_columns = sorted(columns)
+    join_relationships = extract_join_relationships(sql, SQL_DIALECT)
+    filters = extract_filters(sql, SQL_DIALECT)
+    intent = extract_intent(question, sql)
+
+    output_lines = ["Relevant Tables:"]
+    if relevant_tables:
+        output_lines.extend([f"- {table}" for table in relevant_tables])
+    else:
+        output_lines.append("- (none)")
+
+    output_lines.append("")
+    output_lines.append("Relevant Columns:")
+    if relevant_columns:
+        table_to_columns = {}
+        for column in relevant_columns:
+            table_name, column_name = column.split(".", 1) if "." in column else ("?", column)
+            table_to_columns.setdefault(table_name, []).append(column_name)
+        for table_name in sorted(table_to_columns):
+            columns_text = ", ".join(sorted(table_to_columns[table_name]))
+            output_lines.append(f"- {table_name}: {columns_text}")
+    else:
+        output_lines.append("- (none)")
+
+    output_lines.append("")
+    output_lines.append("Join Relationships:")
+    if join_relationships:
+        output_lines.extend([f"- {join}" for join in join_relationships])
+    else:
+        output_lines.append("- (none)")
+
+    output_lines.append("")
+    output_lines.append("Filters / Constraints:")
+    if filters:
+        output_lines.extend([f"- {flt}" for flt in filters])
+    else:
+        output_lines.append("- (none)")
+
+    output_lines.append("")
+    output_lines.append("Question Intent:")
+    output_lines.append(f"- {intent}")
+
+    output_text = "\n".join(output_lines).strip()
+
     output_obj = {
         "tables": [
             {"name": t, "reason": build_reasoning_table(t, question, sql)}
-            for t in sorted(tables)
+            for t in relevant_tables
         ],
         "columns": [
             {"name": c, "reason": build_reasoning_column(c, question, sql)}
-            for c in sorted(columns)
+            for c in relevant_columns
         ],
+        "joins": join_relationships,
+        "filters": filters,
+        "intent": intent,
     }
-
-    # Serialize to compact JSON string for training target
-    output_text = json.dumps(output_obj, ensure_ascii=False)
 
     return {
         "input": input_text,

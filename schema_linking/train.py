@@ -79,16 +79,25 @@ def tokenize_dataset(
     """
     tokenized = []
     for entry in data:
-        text = format_prompt(entry)
-        encoding = tokenizer(
-            text,
+        prompt_text = entry["input"]
+        full_text = format_prompt(entry)
+        prompt_encoding = tokenizer(
+            prompt_text,
             truncation=True,
             max_length=max_length,
             return_tensors=None,
         )
-        # The collator expects dicts with these keys
-        encoding["labels"] = list(encoding["input_ids"])
-        tokenized.append(encoding)
+        full_encoding = tokenizer(
+            full_text,
+            truncation=True,
+            max_length=max_length,
+            return_tensors=None,
+        )
+        prompt_length = len(prompt_encoding["input_ids"])
+        labels = list(full_encoding["input_ids"])
+        labels[:prompt_length] = [-100] * min(prompt_length, len(labels))
+        full_encoding["labels"] = labels
+        tokenized.append(full_encoding)
 
     return tokenized
 
@@ -113,7 +122,7 @@ def load_model(model_name: str):
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float16 if FP16 else torch.bfloat16 if BF16 else torch.float32,
+        dtype=torch.float16 if FP16 else torch.bfloat16 if BF16 else torch.float32,
         trust_remote_code=True,
         device_map={"": local_rank} if torch.cuda.is_available() else None,
     )
@@ -295,9 +304,10 @@ class SchemaLinkingTrainer:
 
     def create_trainer(self, model, train_data, val_data, tokenizer):
         """Create the HuggingFace Trainer instance."""
+        world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
         steps_per_epoch = math.ceil(
             len(train_data)
-            / max(1, PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS)
+            / max(1, PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * world_size)
         )
         total_steps = max(1, steps_per_epoch * NUM_TRAIN_EPOCHS)
         training_args = TrainingArguments(
@@ -408,9 +418,10 @@ class SchemaLinkingTrainer:
         trainer = self.create_trainer(model, train_data, val_data, tokenizer)
         status_monitor = None
         if _is_rank_zero():
+            world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
             steps_per_epoch = math.ceil(
                 len(train_data)
-                / max(1, PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS)
+                / max(1, PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * world_size)
             )
             total_steps = max(1, steps_per_epoch * NUM_TRAIN_EPOCHS)
             print(
@@ -418,6 +429,7 @@ class SchemaLinkingTrainer:
                 f"train examples={len(train_data)} | "
                 f"batch={PER_DEVICE_TRAIN_BATCH_SIZE} | "
                 f"grad_accum={GRADIENT_ACCUMULATION_STEPS} | "
+                f"world_size={world_size} | "
                 f"steps/epoch≈{steps_per_epoch} | total_steps≈{total_steps}",
                 flush=True,
             )
