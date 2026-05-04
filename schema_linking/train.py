@@ -14,6 +14,9 @@ Uses:
 
 import json
 import argparse
+import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import List, Dict
 
@@ -90,6 +93,10 @@ def load_model(model_name: str):
     """Load the base model and tokenizer."""
     print(f"\nLoading model: {model_name}")
 
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
         trust_remote_code=True,
@@ -104,7 +111,7 @@ def load_model(model_name: str):
         model_name,
         torch_dtype=torch.float16 if FP16 else torch.bfloat16 if BF16 else torch.float32,
         trust_remote_code=True,
-        device_map="auto",
+        device_map={"": local_rank} if torch.cuda.is_available() else None,
     )
 
     # Enable gradient checkpointing for memory efficiency
@@ -113,6 +120,7 @@ def load_model(model_name: str):
 
     print(f"Model loaded: {model.__class__.__name__}")
     print(f"Parameters: {model.num_parameters():,}")
+    print(f"Using local_rank={local_rank}")
 
     return model, tokenizer
 
@@ -185,6 +193,7 @@ class SchemaLinkingTrainer:
             load_best_model_at_end=True,
             metric_for_best_model="eval_loss",
             gradient_checkpointing=GRADIENT_CHECKPOINTING,
+            ddp_find_unused_parameters=False,
             report_to=["tensorboard"],
             remove_unused_columns=False,
             dataloader_num_workers=4,
@@ -224,7 +233,8 @@ class SchemaLinkingTrainer:
         """
         lora_path = Path(self.output_dir) / "lora_adapter"
         print(f"\nSaving LoRA adapter to: {lora_path}")
-        model.save_pretrained(str(lora_path))
+        target_model = getattr(model, "module", model)
+        target_model.save_pretrained(str(lora_path))
         tokenizer.save_pretrained(str(lora_path))
 
         # Save training config for reproducibility
@@ -276,7 +286,8 @@ class SchemaLinkingTrainer:
         trainer.train()
 
         # Save model
-        self.save_model(model, tokenizer)
+        if trainer.is_world_process_zero():
+            self.save_model(model, tokenizer)
 
         print(f"\n{'='*60}")
         print("Training complete!")
@@ -291,7 +302,44 @@ def main():
     parser.add_argument("--val-path", default=OUTPUT_VAL_PATH, help="Path to the validation JSONL file")
     parser.add_argument("--output-dir", default=OUTPUT_DIR, help="Directory for trained adapter outputs")
     parser.add_argument("--base-model", default=MODEL_NAME, help="Base model name or local path")
+    parser.add_argument("--num-gpus", type=int, default=1, help="Number of GPU processes to launch")
+    parser.add_argument(
+        "--gpu-ids",
+        default="0,1,2,3",
+        help="Comma-separated GPU ids to expose to the trainer",
+    )
     args = parser.parse_args()
+
+    gpu_ids = [item.strip() for item in args.gpu_ids.split(",") if item.strip()]
+    if args.num_gpus > len(gpu_ids):
+        raise ValueError("--num-gpus cannot exceed the number of GPU ids provided")
+
+    selected_gpu_ids = gpu_ids[: args.num_gpus]
+    if selected_gpu_ids and "CUDA_VISIBLE_DEVICES" not in os.environ:
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(selected_gpu_ids)
+
+    if args.num_gpus > 1 and not any(key in os.environ for key in ("RANK", "LOCAL_RANK", "WORLD_SIZE")):
+        torchrun_cmd = [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            f"--nproc_per_node={args.num_gpus}",
+            __file__,
+            "--train-path",
+            args.train_path,
+            "--val-path",
+            args.val_path,
+            "--output-dir",
+            args.output_dir,
+            "--base-model",
+            args.base_model,
+            "--num-gpus",
+            str(args.num_gpus),
+            "--gpu-ids",
+            ",".join(selected_gpu_ids),
+        ]
+        print(f"Launching distributed training: {torchrun_cmd}")
+        raise SystemExit(subprocess.call(torchrun_cmd))
 
     trainer = SchemaLinkingTrainer(output_dir=args.output_dir, base_model=args.base_model)
     trainer.train(train_path=args.train_path, val_path=args.val_path)
