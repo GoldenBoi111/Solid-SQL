@@ -28,6 +28,7 @@ from transformers import (
     AutoModelForCausalLM,
     TrainingArguments,
     Trainer,
+    TrainerCallback,
     DataCollatorForSeq2Seq,
 )
 from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
@@ -195,7 +196,7 @@ class RankZeroProgressCallback:
         )
 
 
-class _TrainingStatusCallback:
+class _TrainingStatusCallback(TrainerCallback):
     def __init__(self, total_steps: int) -> None:
         self.progress = RankZeroProgressCallback(total_steps)
 
@@ -205,6 +206,20 @@ class _TrainingStatusCallback:
 
     def on_step_end(self, args, state, control, **kwargs):
         self.progress.on_step_end(int(state.global_step))
+        return control
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not _is_rank_zero() or not logs:
+            return control
+        parts = []
+        if "loss" in logs:
+            parts.append(f"loss={logs['loss']:.4f}")
+        if "eval_loss" in logs:
+            parts.append(f"eval_loss={logs['eval_loss']:.4f}")
+        if "learning_rate" in logs:
+            parts.append(f"lr={logs['learning_rate']:.2e}")
+        if parts:
+            print(f"[Train] step {int(state.global_step)} | " + " | ".join(parts))
         return control
 
 
