@@ -17,6 +17,8 @@ import argparse
 import os
 import subprocess
 import sys
+import math
+import time
 from pathlib import Path
 from typing import List, Dict
 
@@ -146,6 +148,66 @@ def apply_lora(model):
     return model
 
 
+def _is_rank_zero() -> bool:
+    return int(os.environ.get("RANK", "0")) == 0
+
+
+def _format_seconds(seconds: float) -> str:
+    if seconds < 0:
+        seconds = 0
+    minutes, secs = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+class RankZeroProgressCallback:
+    def __init__(self, total_steps: int) -> None:
+        self.total_steps = max(1, total_steps)
+        self.start_time = None
+        self.last_print = 0.0
+
+    def on_train_begin(self) -> None:
+        self.start_time = time.time()
+        self.last_print = 0.0
+        if _is_rank_zero():
+            print(f"[Train] Total optimizer steps: {self.total_steps}")
+
+    def on_step_end(self, step: int) -> None:
+        if not _is_rank_zero():
+            return
+        now = time.time()
+        if now - self.last_print < 30 and step < self.total_steps:
+            return
+        self.last_print = now
+        elapsed = now - (self.start_time or now)
+        completed = max(1, step)
+        rate = elapsed / completed
+        remaining_steps = max(0, self.total_steps - step)
+        eta = rate * remaining_steps
+        print(
+            f"[Train] step {step}/{self.total_steps} | "
+            f"elapsed {_format_seconds(elapsed)} | "
+            f"eta {_format_seconds(eta)}"
+        )
+
+
+class _TrainingStatusCallback:
+    def __init__(self, total_steps: int) -> None:
+        self.progress = RankZeroProgressCallback(total_steps)
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self.progress.on_train_begin()
+        return control
+
+    def on_step_end(self, args, state, control, **kwargs):
+        self.progress.on_step_end(int(state.global_step))
+        return control
+
+
 class SchemaLinkingTrainer:
     """Encapsulates the training pipeline."""
 
@@ -173,6 +235,11 @@ class SchemaLinkingTrainer:
 
     def create_trainer(self, model, train_data, val_data, tokenizer):
         """Create the HuggingFace Trainer instance."""
+        steps_per_epoch = math.ceil(
+            len(train_data)
+            / max(1, PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS)
+        )
+        total_steps = max(1, steps_per_epoch * NUM_TRAIN_EPOCHS)
         training_args = TrainingArguments(
             output_dir=self.output_dir,
             num_train_epochs=NUM_TRAIN_EPOCHS,
@@ -215,6 +282,8 @@ class SchemaLinkingTrainer:
             tokenizer=tokenizer,
             data_collator=data_collator,
         )
+
+        trainer.add_callback(_TrainingStatusCallback(total_steps))
 
         return trainer
 
