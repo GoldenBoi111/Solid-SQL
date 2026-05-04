@@ -24,6 +24,17 @@ from schema_linking.config import INSTRUCTION_TEMPLATE
 SCHEMA_LINKING_PROMPT = INSTRUCTION_TEMPLATE
 
 
+def normalize_spider_record(item: Dict[str, object], fallback_index: int) -> Dict[str, object]:
+    return {
+        "question_id": item.get("question_id", fallback_index),
+        "question": item.get("question", ""),
+        "evidence": item.get("evidence", ""),
+        "db_id": item.get("db_id", ""),
+        "difficulty": item.get("difficulty", "unknown"),
+        "gold_sql": item.get("SQL", item.get("sql", item.get("gold_sql", ""))),
+    }
+
+
 def load_schema_for_db(db_path: str) -> str:
     try:
         connection = sqlite3.connect(db_path)
@@ -177,18 +188,22 @@ class LoRASchemaLinker:
         self._model = model
         self._tokenizer = tokenizer
 
-    def _build_prompt(self, question: str, schema_text: str) -> str:
-        return SCHEMA_LINKING_PROMPT.format(question=question, schema_text=schema_text)
+    def _build_prompt(self, question: str, schema_text: str, evidence: str = "") -> str:
+        prompt = SCHEMA_LINKING_PROMPT.format(question=question, schema_text=schema_text)
+        if evidence:
+            prompt += "\n\n## BENCHMARK EVIDENCE\n" + evidence
+        return prompt
 
     def predict(
         self,
         question: str,
         schema_text: str,
+        evidence: str = "",
         max_new_tokens: int = 768,
     ) -> Dict[str, object]:
         self._load_model()
 
-        prompt = self._build_prompt(question, schema_text)
+        prompt = self._build_prompt(question, schema_text, evidence=evidence)
         device = next(self._model.parameters()).device
         inputs = self._tokenizer(
             [prompt],
@@ -236,9 +251,13 @@ def run_batch_schema_linking(
     schema_cache: Dict[str, str] = {}
 
     for index, item in enumerate(questions_data):
-        question_id = item.get("question_id", index)
-        question = item["question"]
-        db_id = item["db_id"]
+        normalized = normalize_spider_record(item, index)
+        question_id = normalized["question_id"]
+        question = normalized["question"]
+        evidence = normalized["evidence"]
+        db_id = normalized["db_id"]
+        difficulty = normalized["difficulty"]
+        gold_sql = normalized["gold_sql"]
 
         db_path = Path(databases_dir) / db_id / f"{db_id}.sqlite"
         if not db_path.exists():
@@ -251,11 +270,14 @@ def run_batch_schema_linking(
             schema_cache[db_id] = load_schema_for_db(str(db_path))
         schema_text = schema_cache[db_id]
 
-        linked_schema = linker.predict(question=question, schema_text=schema_text)
+        linked_schema = linker.predict(question=question, schema_text=schema_text, evidence=evidence)
         record = {
             "question_id": question_id,
             "db_id": db_id,
             "question": question,
+            "evidence": evidence,
+            "difficulty": difficulty,
+            "gold_sql": gold_sql,
             "schema_text": schema_text,
             "schema_linking": linked_schema,
         }
@@ -274,6 +296,7 @@ def run_batch_schema_linking(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Standalone LoRA schema linker")
     parser.add_argument("--question", help="Natural language question")
+    parser.add_argument("--evidence", default="", help="Optional benchmark evidence for single-question mode")
     parser.add_argument("--schema-file", help="Path to a text file containing schema text")
     parser.add_argument("--schema-text", help="Schema text provided directly")
     parser.add_argument("--questions", help="Path to question dataset JSON")
@@ -315,7 +338,10 @@ def main() -> None:
                 "Single mode requires --question and either --schema-text or --schema-file; "
                 "batch mode requires --questions and --databases"
             )
-        result = linker.predict(args.question, schema_text)
+        if args.evidence:
+            result = linker.predict(args.question, schema_text, evidence=args.evidence)
+        else:
+            result = linker.predict(args.question, schema_text)
 
     if args.output:
         Path(args.output).write_text(

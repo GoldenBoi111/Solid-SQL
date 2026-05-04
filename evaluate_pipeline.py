@@ -35,6 +35,18 @@ def summarize_sql(sql: str, limit: int = 180) -> str:
     return summarize_text(sql, limit=limit)
 
 
+def normalize_spider_record(item: Dict, fallback_index: int) -> Dict[str, str]:
+    """Normalize Spider-style and legacy benchmark records into one shape."""
+    return {
+        "question_id": item.get("question_id", fallback_index),
+        "question": item.get("question", ""),
+        "evidence": item.get("evidence", ""),
+        "db_id": item.get("db_id", ""),
+        "difficulty": item.get("difficulty", "unknown"),
+        "ground_truth_sql": item.get("SQL", item.get("sql", item.get("gold_sql", ""))),
+    }
+
+
 def load_schema_for_db(db_path: str) -> str:
     """
     Load schema for a SQLite database.
@@ -157,15 +169,20 @@ def evaluate_questions(
     print(f"Processing {len(questions_data)} questions...")
     
     for i, item in enumerate(questions_data):
-        question_id = item.get("question_id", i)
-        question = item["question"]
-        db_id = item["db_id"]
-        ground_truth_sql = item.get("SQL", item.get("sql", ""))
+        normalized = normalize_spider_record(item, i)
+        question_id = normalized["question_id"]
+        question = normalized["question"]
+        evidence = normalized["evidence"]
+        db_id = normalized["db_id"]
+        difficulty = normalized["difficulty"]
+        ground_truth_sql = normalized["ground_truth_sql"]
         
         print("\n" + "-" * 80)
         print(f"[Question {i+1}/{len(questions_data)}] ID: {question_id}")
         print(f"Question: {question}")
         print(f"Database: {db_id}")
+        if evidence:
+            print(f"Evidence: {evidence}")
         
         # Find database file
         db_path = os.path.join(databases_dir, db_id, f"{db_id}.sqlite")
@@ -199,8 +216,9 @@ def evaluate_questions(
         
         try:
             print("[Stage 2: Generation] Running SolidSQL pipeline...")
+            generation_question = question if not evidence else f"{question}\n\nEvidence: {evidence}"
             result = solidsql.generate_sql(
-                question=question,
+                question=generation_question,
                 schema_text=schema_text,
                 top_n=3,
                 round_2_refinement=True
@@ -247,6 +265,8 @@ def evaluate_questions(
                 "question_id": question_id,
                 "db_id": db_id,
                 "question": question,
+                "evidence": evidence,
+                "difficulty": difficulty,
                 "generated_sql": generated_sql,
                 "ground_truth_sql": ground_truth_sql,
                 "generated_results_count": len(generated_results),
@@ -267,6 +287,8 @@ def evaluate_questions(
                 "question_id": question_id,
                 "db_id": db_id,
                 "question": question,
+                "evidence": evidence,
+                "difficulty": difficulty,
                 "generated_sql": "",
                 "ground_truth_sql": ground_truth_sql,
                 "error": str(e),
