@@ -15,8 +15,6 @@ Uses:
 import json
 import argparse
 import os
-import subprocess
-import sys
 import math
 import time
 import threading
@@ -106,10 +104,6 @@ def load_model(model_name: str):
     """Load the base model and tokenizer."""
     print(f"\nLoading model: {model_name}")
 
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
-
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
         trust_remote_code=True,
@@ -124,7 +118,7 @@ def load_model(model_name: str):
         model_name,
         dtype=torch.float16 if FP16 else torch.bfloat16 if BF16 else torch.float32,
         trust_remote_code=True,
-        device_map={"": local_rank} if torch.cuda.is_available() else None,
+        device_map={"": 0} if torch.cuda.is_available() else None,
     )
 
     # Enable gradient checkpointing for memory efficiency
@@ -133,7 +127,6 @@ def load_model(model_name: str):
 
     print(f"Model loaded: {model.__class__.__name__}")
     print(f"Parameters: {model.num_parameters():,}")
-    print(f"Using local_rank={local_rank}")
 
     return model, tokenizer
 
@@ -304,10 +297,9 @@ class SchemaLinkingTrainer:
 
     def create_trainer(self, model, train_data, val_data, tokenizer):
         """Create the HuggingFace Trainer instance."""
-        world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
         steps_per_epoch = math.ceil(
             len(train_data)
-            / max(1, PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * world_size)
+            / max(1, PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS)
         )
         total_steps = max(1, steps_per_epoch * NUM_TRAIN_EPOCHS)
         training_args = TrainingArguments(
@@ -418,10 +410,9 @@ class SchemaLinkingTrainer:
         trainer = self.create_trainer(model, train_data, val_data, tokenizer)
         status_monitor = None
         if _is_rank_zero():
-            world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
             steps_per_epoch = math.ceil(
                 len(train_data)
-                / max(1, PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * world_size)
+                / max(1, PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS)
             )
             total_steps = max(1, steps_per_epoch * NUM_TRAIN_EPOCHS)
             print(
@@ -429,7 +420,6 @@ class SchemaLinkingTrainer:
                 f"train examples={len(train_data)} | "
                 f"batch={PER_DEVICE_TRAIN_BATCH_SIZE} | "
                 f"grad_accum={GRADIENT_ACCUMULATION_STEPS} | "
-                f"world_size={world_size} | "
                 f"steps/epoch≈{steps_per_epoch} | total_steps≈{total_steps}",
                 flush=True,
             )
@@ -465,44 +455,7 @@ def main():
     parser.add_argument("--val-path", default=OUTPUT_VAL_PATH, help="Path to the validation JSONL file")
     parser.add_argument("--output-dir", default=OUTPUT_DIR, help="Directory for trained adapter outputs")
     parser.add_argument("--base-model", default=MODEL_NAME, help="Base model name or local path")
-    parser.add_argument("--num-gpus", type=int, default=1, help="Number of GPU processes to launch")
-    parser.add_argument(
-        "--gpu-ids",
-        default="0,1,2,3",
-        help="Comma-separated GPU ids to expose to the trainer",
-    )
     args = parser.parse_args()
-
-    gpu_ids = [item.strip() for item in args.gpu_ids.split(",") if item.strip()]
-    if args.num_gpus > len(gpu_ids):
-        raise ValueError("--num-gpus cannot exceed the number of GPU ids provided")
-
-    selected_gpu_ids = gpu_ids[: args.num_gpus]
-    if selected_gpu_ids and "CUDA_VISIBLE_DEVICES" not in os.environ:
-        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(selected_gpu_ids)
-
-    if args.num_gpus > 1 and not any(key in os.environ for key in ("RANK", "LOCAL_RANK", "WORLD_SIZE")):
-        torchrun_cmd = [
-            sys.executable,
-            "-m",
-            "torch.distributed.run",
-            f"--nproc_per_node={args.num_gpus}",
-            __file__,
-            "--train-path",
-            args.train_path,
-            "--val-path",
-            args.val_path,
-            "--output-dir",
-            args.output_dir,
-            "--base-model",
-            args.base_model,
-            "--num-gpus",
-            str(args.num_gpus),
-            "--gpu-ids",
-            ",".join(selected_gpu_ids),
-        ]
-        print(f"Launching distributed training: {torchrun_cmd}")
-        raise SystemExit(subprocess.call(torchrun_cmd))
 
     trainer = SchemaLinkingTrainer(output_dir=args.output_dir, base_model=args.base_model)
     trainer.train(train_path=args.train_path, val_path=args.val_path)
