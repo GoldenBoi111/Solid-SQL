@@ -19,6 +19,7 @@ import subprocess
 import sys
 import math
 import time
+import threading
 from pathlib import Path
 from typing import List, Dict
 
@@ -223,6 +224,50 @@ class _TrainingStatusCallback(TrainerCallback):
         return control
 
 
+class TrainingStatusMonitor(threading.Thread):
+    def __init__(self, trainer, total_steps: int, interval_seconds: int = 15) -> None:
+        super().__init__(daemon=True)
+        self.trainer = trainer
+        self.total_steps = max(1, total_steps)
+        self.interval_seconds = interval_seconds
+        self.stop_event = threading.Event()
+        self.start_time = time.time()
+        self.last_step = -1
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    def run(self) -> None:
+        if not _is_rank_zero():
+            return
+        print(f"[Train] Total optimizer steps: {self.total_steps}", flush=True)
+        print(f"[Train] Status heartbeat every {self.interval_seconds}s", flush=True)
+        while not self.stop_event.wait(self.interval_seconds):
+            step = int(getattr(self.trainer.state, "global_step", 0))
+            elapsed = time.time() - self.start_time
+            if step <= 0:
+                print(f"[Train] waiting for first step | elapsed {_format_seconds(elapsed)}", flush=True)
+                continue
+            if step == self.last_step:
+                print(
+                    f"[Train] step {step}/{self.total_steps} | "
+                    f"elapsed {_format_seconds(elapsed)} | "
+                    f"eta pending",
+                    flush=True,
+                )
+                continue
+            self.last_step = step
+            rate = elapsed / max(1, step)
+            remaining_steps = max(0, self.total_steps - step)
+            eta = rate * remaining_steps
+            print(
+                f"[Train] step {step}/{self.total_steps} | "
+                f"elapsed {_format_seconds(elapsed)} | "
+                f"eta {_format_seconds(eta)}",
+                flush=True,
+            )
+
+
 class SchemaLinkingTrainer:
     """Encapsulates the training pipeline."""
 
@@ -361,13 +406,35 @@ class SchemaLinkingTrainer:
 
         # Create trainer
         trainer = self.create_trainer(model, train_data, val_data, tokenizer)
+        status_monitor = None
+        if _is_rank_zero():
+            steps_per_epoch = math.ceil(
+                len(train_data)
+                / max(1, PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS)
+            )
+            total_steps = max(1, steps_per_epoch * NUM_TRAIN_EPOCHS)
+            print(
+                f"[Train] Planning for {NUM_TRAIN_EPOCHS} epochs | "
+                f"train examples={len(train_data)} | "
+                f"batch={PER_DEVICE_TRAIN_BATCH_SIZE} | "
+                f"grad_accum={GRADIENT_ACCUMULATION_STEPS} | "
+                f"steps/epoch≈{steps_per_epoch} | total_steps≈{total_steps}",
+                flush=True,
+            )
+            status_monitor = TrainingStatusMonitor(trainer, total_steps)
+            status_monitor.start()
 
         # Train
         print(f"\n{'='*60}")
         print("Starting training...")
         print(f"{'='*60}")
 
-        trainer.train()
+        try:
+            trainer.train()
+        finally:
+            if status_monitor is not None:
+                status_monitor.stop()
+                status_monitor.join(timeout=5)
 
         # Save model
         if trainer.is_world_process_zero():
