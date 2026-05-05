@@ -314,7 +314,26 @@ class DebugTrainer(Trainer):
                 flush=True,
             )
         self._microbatch_start_time = time.time()
-        loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+        if is_rank_zero():
+            print(f"[Batch] microbatch {self._microbatch_index} forward start", flush=True)
+        with self.compute_loss_context_manager():
+            loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
+        if is_rank_zero():
+            loss_value = loss.detach().float().item() if torch.is_tensor(loss) else float(loss)
+            print(
+                f"[Batch] microbatch {self._microbatch_index} forward done | "
+                f"loss={loss_value:.4f} | backward start",
+                flush=True,
+            )
+        self.accelerator.backward(loss)
+        if is_rank_zero():
+            print(f"[Batch] microbatch {self._microbatch_index} backward done", flush=True)
+        loss = loss.detach()
+        if self.args.n_gpu > 1:
+            loss = loss.mean()
+        loss = loss / self.args.gradient_accumulation_steps
         if is_rank_zero():
             elapsed = time.time() - (self._microbatch_start_time or time.time())
             loss_value = loss.detach().float().item() if torch.is_tensor(loss) else float(loss)
@@ -345,7 +364,7 @@ class SchemaLinkingTrainer:
         save_steps: int = DEFAULT_SAVE_STEPS,
         logging_steps: int = DEFAULT_LOGGING_STEPS,
         eval_steps: int = DEFAULT_EVAL_STEPS,
-        gradient_checkpointing: bool = GRADIENT_CHECKPOINTING,
+        gradient_checkpointing: bool = False,
         run_final_eval: bool = False,
     ) -> None:
         self.output_dir = output_dir
@@ -473,6 +492,7 @@ class SchemaLinkingTrainer:
         print(f"Output dir: {self.output_dir}")
         print(f"Max seq length: {self.max_seq_length}")
         print("4-bit loading: disabled (plain LoRA)")
+        print("Gradient checkpointing: disabled")
 
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
 
@@ -574,7 +594,7 @@ def main():
         max_seq_length=args.max_seq_length,
         save_steps=args.save_steps,
         logging_steps=args.logging_steps,
-        gradient_checkpointing=GRADIENT_CHECKPOINTING,
+        gradient_checkpointing=False,
         run_final_eval=args.run_final_eval,
     )
     trainer.train(train_path=args.train_path, val_path=args.val_path)
