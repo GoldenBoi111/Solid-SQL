@@ -33,6 +33,11 @@ from transformers import (
 )
 from peft import LoraConfig, TaskType, get_peft_model
 
+if torch.cuda.is_available():
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_math_sdp(True)
+
 from config import (
     BF16,
     FP16,
@@ -116,7 +121,8 @@ def load_model(
         model_name,
         trust_remote_code=True,
         low_cpu_mem_usage=True,
-        dtype=compute_dtype,
+        torch_dtype=compute_dtype,
+        attn_implementation="eager",
         device_map={"": 0} if torch.cuda.is_available() else None,
     )
     model.config.use_cache = False
@@ -491,8 +497,14 @@ class SchemaLinkingTrainer:
         print(f"Val path: {val_path}")
         print(f"Output dir: {self.output_dir}")
         print(f"Max seq length: {self.max_seq_length}")
+        print(f"Per-device train batch size: {self.train_batch_size}")
         print("4-bit loading: disabled (plain LoRA)")
         print("Gradient checkpointing: disabled")
+        if self.train_batch_size != 1:
+            print(
+                "[Warn] Train batch size is not 1; if you want to avoid SDPA edge cases, "
+                "run with --train-batch-size 1."
+            )
 
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
 
