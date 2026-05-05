@@ -8,21 +8,20 @@ Goals:
 - prompt tokens masked from loss
 - label padding uses -100
 - preflight first-batch check before training
-- clear batch-level logging so stalls are visible immediately
+- progress logging at step level, not microbatch spam
 """
 
 import argparse
 import json
 import math
 import os
-import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
 import torch
 from peft import LoraConfig, TaskType, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
+from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainerCallback, TrainingArguments
 
 from config import (
     BF16,
@@ -50,6 +49,7 @@ DEFAULT_MAX_SEQ_LENGTH = min(MAX_SEQ_LENGTH, 1024)
 DEFAULT_GRADIENT_ACCUMULATION_STEPS = 1
 DEFAULT_SAVE_STEPS = 250
 DEFAULT_LOGGING_STEPS = 10
+DEFAULT_HEARTBEAT_SECONDS = 30
 
 
 if torch.cuda.is_available():
@@ -91,6 +91,17 @@ def load_dtype() -> torch.dtype:
     if FP16:
         return torch.float16
     return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+
+def enforce_single_gpu_visibility() -> None:
+    if not torch.cuda.is_available():
+        return
+    visible = torch.cuda.device_count()
+    if visible != 1:
+        raise RuntimeError(
+            "This trainer requires exactly one visible GPU. "
+            f"Found {visible}. Re-run with CUDA_VISIBLE_DEVICES=<one_gpu_id>."
+        )
 
 
 def load_model(model_name: str, *, gradient_checkpointing: bool) -> Tuple[torch.nn.Module, AutoTokenizer]:
@@ -255,60 +266,55 @@ def tokenize_dataset(data: List[Dict], tokenizer: AutoTokenizer, max_length: int
     return tokenized
 
 
-class BatchLoggerTrainer(Trainer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._batch_index = 0
+class ProgressCallback(TrainerCallback):
+    def __init__(self, total_steps: int, heartbeat_seconds: int = DEFAULT_HEARTBEAT_SECONDS) -> None:
+        self.total_steps = max(1, total_steps)
+        self.heartbeat_seconds = heartbeat_seconds
+        self.start_time = 0.0
+        self.last_heartbeat = 0.0
 
-    def training_step(self, model, inputs, num_items_in_batch=None):
-        self._batch_index += 1
+    def on_train_begin(self, args, state, control, **kwargs):
         if is_rank_zero():
-            shape = tuple(inputs["input_ids"].shape) if "input_ids" in inputs else ()
-            print(
-                f"[Batch] enter microbatch {self._batch_index} | "
-                f"global_step={int(getattr(self.state, 'global_step', 0))} | "
-                f"shape={shape}",
-                flush=True,
-            )
+            self.start_time = time.time()
+            self.last_heartbeat = self.start_time
+            print(f"[Train] Total optimizer steps: {self.total_steps}", flush=True)
+            print(f"[Train] Status heartbeat every {self.heartbeat_seconds}s", flush=True)
+        return control
 
-        start = time.time()
-        result = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
-
-        if is_rank_zero():
-            elapsed = time.time() - start
-            loss_value = result.detach().float().item() if torch.is_tensor(result) else float(result)
-            print(
-                f"[Batch] exit microbatch {self._batch_index} | "
-                f"loss={loss_value:.4f} | "
-                f"elapsed={elapsed:.2f}s",
-                flush=True,
-            )
-        return result
-
-
-class FirstStepMonitor(threading.Thread):
-    def __init__(self, trainer: Trainer, interval_seconds: int = 15) -> None:
-        super().__init__(daemon=True)
-        self.trainer = trainer
-        self.interval_seconds = interval_seconds
-        self.start_time = time.time()
-        self.stop_event = threading.Event()
-
-    def stop(self) -> None:
-        self.stop_event.set()
-
-    def run(self) -> None:
+    def on_step_end(self, args, state, control, **kwargs):
         if not is_rank_zero():
-            return
+            return control
+        now = time.time()
+        if now - self.last_heartbeat < self.heartbeat_seconds and state.global_step < self.total_steps:
+            return control
+        self.last_heartbeat = now
+        elapsed = now - self.start_time
+        completed = max(1, int(state.global_step))
+        rate = elapsed / completed
+        remaining = max(0, self.total_steps - completed)
+        eta = rate * remaining
+        print(
+            f"[Train] step {completed}/{self.total_steps} | "
+            f"elapsed {fmt_seconds(elapsed)} | eta {fmt_seconds(eta)}",
+            flush=True,
+        )
+        return control
 
-        print(f"[Train] Status heartbeat every {self.interval_seconds}s", flush=True)
-        while not self.stop_event.wait(self.interval_seconds):
-            step = int(getattr(self.trainer.state, "global_step", 0))
-            elapsed = time.time() - self.start_time
-            if step <= 0:
-                print(f"[Train] waiting for first step | elapsed {fmt_seconds(elapsed)}", flush=True)
-            else:
-                print(f"[Train] step {step} | elapsed {fmt_seconds(elapsed)}", flush=True)
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not is_rank_zero() or not logs:
+            return control
+        parts = []
+        if "loss" in logs:
+            parts.append(f"loss={logs['loss']:.4f}")
+        if "grad_norm" in logs:
+            parts.append(f"grad_norm={logs['grad_norm']:.4f}")
+        if "learning_rate" in logs:
+            parts.append(f"lr={logs['learning_rate']:.2e}")
+        if "epoch" in logs:
+            parts.append(f"epoch={logs['epoch']:.3f}")
+        if parts:
+            print(f"[Train] log | " + " | ".join(parts), flush=True)
+        return control
 
 
 def preflight_first_batch(
@@ -428,7 +434,7 @@ class SchemaLinkingTrainer:
         )
 
         collator = CausalLMDataCollator(tokenizer, pad_to_multiple_of=8)
-        trainer = BatchLoggerTrainer(
+        trainer = Trainer(
             model=model,
             args=training_args,
             train_dataset=train_data,
@@ -469,6 +475,8 @@ class SchemaLinkingTrainer:
         print("  Adapter saved.")
 
     def train(self, train_path: str = OUTPUT_TRAIN_PATH, val_path: str = OUTPUT_VAL_PATH):
+        enforce_single_gpu_visibility()
+
         print("=" * 60)
         print("Schema Linking Training Pipeline")
         print("=" * 60)
@@ -508,13 +516,8 @@ class SchemaLinkingTrainer:
         print("Starting training...")
         print(f"{'=' * 60}")
 
-        monitor = FirstStepMonitor(trainer, interval_seconds=15)
-        monitor.start()
-        try:
-            result = trainer.train()
-        finally:
-            monitor.stop()
-            monitor.join(timeout=5)
+        trainer.add_callback(ProgressCallback(total_steps))
+        result = trainer.train()
 
         if self.run_final_eval and val_data:
             print("\nRunning final evaluation...")
