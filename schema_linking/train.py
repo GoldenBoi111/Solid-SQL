@@ -19,6 +19,7 @@ The trainer expects JSONL rows with:
 import argparse
 import json
 import math
+import os
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -258,6 +259,10 @@ def get_model_device(model: torch.nn.Module) -> torch.device:
     return next(model.parameters()).device
 
 
+def is_rank_zero() -> bool:
+    return int(os.environ.get("RANK", "0")) == 0
+
+
 def preflight_first_batch(
     model: torch.nn.Module,
     dataset: List[Dict],
@@ -290,6 +295,36 @@ def preflight_first_batch(
 
     elapsed = time.time() - start_time
     print(f"[Preflight] First batch forward/backward passed in {elapsed:.2f}s.")
+
+
+class DebugTrainer(Trainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._microbatch_index = 0
+        self._microbatch_start_time = None
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        self._microbatch_index += 1
+        if is_rank_zero():
+            input_shape = tuple(inputs["input_ids"].shape) if "input_ids" in inputs else ()
+            print(
+                f"[Batch] enter microbatch {self._microbatch_index} | "
+                f"global_step={int(getattr(self.state, 'global_step', 0))} | "
+                f"shape={input_shape}",
+                flush=True,
+            )
+        self._microbatch_start_time = time.time()
+        loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+        if is_rank_zero():
+            elapsed = time.time() - (self._microbatch_start_time or time.time())
+            loss_value = loss.detach().float().item() if torch.is_tensor(loss) else float(loss)
+            print(
+                f"[Batch] exit microbatch {self._microbatch_index} | "
+                f"loss={loss_value:.4f} | "
+                f"elapsed={elapsed:.2f}s",
+                flush=True,
+            )
+        return loss
 
 
 class SchemaLinkingTrainer:
@@ -385,7 +420,7 @@ class SchemaLinkingTrainer:
 
         data_collator = CausalLMDataCollator(tokenizer, pad_to_multiple_of=8)
 
-        trainer = Trainer(
+        trainer = DebugTrainer(
             model=model,
             args=training_args,
             train_dataset=train_data,
