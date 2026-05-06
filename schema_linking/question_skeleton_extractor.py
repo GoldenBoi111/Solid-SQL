@@ -110,7 +110,9 @@ class QuestionSkeletonExtractor:
             self._tokenizer = AutoTokenizer.from_pretrained(
                 self.model_name,
                 trust_remote_code=True,
+                padding_side="left",
             )
+            self._tokenizer.padding_side = "left"
             
             # Set pad token if not set
             if self._tokenizer.pad_token is None:
@@ -203,9 +205,9 @@ class QuestionSkeletonExtractor:
                     eos_token_id=self._tokenizer.eos_token_id,
                 )
                 
-                batch_attention = batch_inputs["attention_mask"].sum(dim=1).tolist()
-                for output, prompt_length in zip(outputs, batch_attention):
-                    generated_tokens = output[int(prompt_length):]
+                input_width = batch_inputs["input_ids"].shape[1]
+                for output in outputs:
+                    generated_tokens = output[input_width:]
                     skeleton = self._tokenizer.decode(generated_tokens, skip_special_tokens=True)
                     # Clean up the response
                     skeleton = self._clean_response(skeleton)

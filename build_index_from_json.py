@@ -28,6 +28,8 @@ JSON Input Format:
         },
         ...
     ]
+
+Also supports Spider-style records with `SQL` or `query` fields.
 """
 
 import argparse
@@ -67,6 +69,7 @@ def build_and_save_index(
     examples: list,
     output_path: str,
     index_type: str = "hnsw",
+    top_n: int = 5,
 ):
     """Build FAISS index and save it."""
     
@@ -97,7 +100,7 @@ def build_and_save_index(
         test_question = examples[0]["question"]
         results = retriever.retrieve_by_question(
             question=test_question,
-            top_n=3,
+            top_n=top_n,
             show_progress=True,
         )
         
@@ -181,7 +184,7 @@ Examples:
         sys.exit(1)
     
     # Build and save index
-    build_and_save_index(examples, args.output, args.type)
+    build_and_save_index(examples, args.output, args.type, args.top_n)
     
     # Print summary
     print("\n" + "=" * 60)

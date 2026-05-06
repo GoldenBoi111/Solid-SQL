@@ -243,7 +243,9 @@ class SchemaLinker:
             hf_tokenizer = AutoTokenizer.from_pretrained(
                 self.base_model_name,
                 trust_remote_code=True,
+                padding_side="left",
             )
+            hf_tokenizer.padding_side = "left"
             if hf_tokenizer.pad_token is None:
                 hf_tokenizer.pad_token = hf_tokenizer.eos_token
 
@@ -354,9 +356,9 @@ class SchemaLinker:
                     eos_token_id=self._tokenizer.eos_token_id,
                 )
 
-            prompt_lengths = tokenized["attention_mask"].sum(dim=1).tolist()
-            for output, prompt_length in zip(outputs, prompt_lengths):
-                generated_tokens = output[int(prompt_length):]
+            input_width = tokenized["input_ids"].shape[1]
+            for output in outputs:
+                generated_tokens = output[input_width:]
                 text = self._tokenizer.decode(
                     generated_tokens,
                     skip_special_tokens=True,
@@ -412,9 +414,9 @@ class SchemaLinker:
                     eos_token_id=self._tokenizer.eos_token_id,
                 )
 
-            prompt_lengths = inputs["attention_mask"].sum(dim=1).tolist()
-            for output, prompt_length in zip(outputs, prompt_lengths):
-                generated_tokens = output[int(prompt_length):]
+            input_width = inputs["input_ids"].shape[1]
+            for output in outputs:
+                generated_tokens = output[input_width:]
                 text = self._tokenizer.decode(
                     generated_tokens,
                     skip_special_tokens=True,
