@@ -191,7 +191,6 @@ class LoRASchemaLinker:
         return SCHEMA_LINKING_PROMPT.format(
             question=question,
             schema_text=schema_text,
-            evidence_block="(none provided)",
         )
 
     def predict(
@@ -273,7 +272,6 @@ def run_batch_schema_linking(
             "question_id": question_id,
             "db_id": db_id,
             "question": question,
-            "evidence": evidence,
             "difficulty": difficulty,
             "gold_sql": gold_sql,
             "schema_text": schema_text,
@@ -294,7 +292,6 @@ def run_batch_schema_linking(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Standalone LoRA schema linker")
     parser.add_argument("--question", help="Natural language question")
-    parser.add_argument("--evidence", default="", help="Optional benchmark evidence for single-question mode")
     parser.add_argument("--schema-file", help="Path to a text file containing schema text")
     parser.add_argument("--schema-text", help="Schema text provided directly")
     parser.add_argument("--questions", help="Path to question dataset JSON")
@@ -336,10 +333,7 @@ def main() -> None:
                 "Single mode requires --question and either --schema-text or --schema-file; "
                 "batch mode requires --questions and --databases"
             )
-        if args.evidence:
-            result = linker.predict(args.question, schema_text, evidence=args.evidence)
-        else:
-            result = linker.predict(args.question, schema_text)
+        result = linker.predict(args.question, schema_text)
 
     if args.output:
         Path(args.output).write_text(
