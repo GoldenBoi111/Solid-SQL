@@ -61,6 +61,9 @@ class SQLSkeletonExtractor:
         Returns:
             The extracted SQL skeleton with placeholders
         """
+        if not isinstance(sql, str):
+            sql = str(sql)
+
         try:
             parsed = sqlglot.parse_one(sql, dialect=self.dialect)
         except sqlglot.errors.ParseError as e:

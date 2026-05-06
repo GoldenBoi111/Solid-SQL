@@ -62,14 +62,8 @@ INSTRUCTION_TEMPLATE = (
     "---\n\n"
     "## USER QUESTION\n"
     "{question}\n\n"
-
-    "## BENCHMARK EVIDENCE\n"
-    "{evidence_block}\n\n"
-
-    "---\n\n"
     "## SPIDER CONTEXT\n"
     "- The question comes from a Spider-style benchmark example.\n"
-    "- Use the evidence if it is provided.\n"
     "- Focus only on schema grounding, not SQL generation.\n\n"
 
     "---\n\n"

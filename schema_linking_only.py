@@ -28,7 +28,6 @@ def normalize_spider_record(item: Dict[str, object], fallback_index: int) -> Dic
     return {
         "question_id": item.get("question_id", fallback_index),
         "question": item.get("question", ""),
-        "evidence": item.get("evidence", ""),
         "db_id": item.get("db_id", ""),
         "difficulty": item.get("difficulty", "unknown"),
         "gold_sql": item.get("SQL", item.get("sql", item.get("gold_sql", ""))),
@@ -188,22 +187,22 @@ class LoRASchemaLinker:
         self._model = model
         self._tokenizer = tokenizer
 
-    def _build_prompt(self, question: str, schema_text: str, evidence: str = "") -> str:
-        prompt = SCHEMA_LINKING_PROMPT.format(question=question, schema_text=schema_text)
-        if evidence:
-            prompt += "\n\n## BENCHMARK EVIDENCE\n" + evidence
-        return prompt
+    def _build_prompt(self, question: str, schema_text: str) -> str:
+        return SCHEMA_LINKING_PROMPT.format(
+            question=question,
+            schema_text=schema_text,
+            evidence_block="(none provided)",
+        )
 
     def predict(
         self,
         question: str,
         schema_text: str,
-        evidence: str = "",
         max_new_tokens: int = 768,
     ) -> Dict[str, object]:
         self._load_model()
 
-        prompt = self._build_prompt(question, schema_text, evidence=evidence)
+        prompt = self._build_prompt(question, schema_text)
         device = next(self._model.parameters()).device
         inputs = self._tokenizer(
             [prompt],
@@ -254,7 +253,6 @@ def run_batch_schema_linking(
         normalized = normalize_spider_record(item, index)
         question_id = normalized["question_id"]
         question = normalized["question"]
-        evidence = normalized["evidence"]
         db_id = normalized["db_id"]
         difficulty = normalized["difficulty"]
         gold_sql = normalized["gold_sql"]
@@ -270,7 +268,7 @@ def run_batch_schema_linking(
             schema_cache[db_id] = load_schema_for_db(str(db_path))
         schema_text = schema_cache[db_id]
 
-        linked_schema = linker.predict(question=question, schema_text=schema_text, evidence=evidence)
+        linked_schema = linker.predict(question=question, schema_text=schema_text)
         record = {
             "question_id": question_id,
             "db_id": db_id,

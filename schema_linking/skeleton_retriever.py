@@ -491,6 +491,21 @@ class SkeletonRetriever:
             pass
 
 
+def _pick_sql_text(entry: Dict[str, Any]) -> Optional[str]:
+    """Pick the best available SQL text field from a dataset row."""
+    candidates = [
+        entry.get("sql"),
+        entry.get("SQL"),
+        entry.get("query"),
+    ]
+
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+
+    return None
+
+
 def load_candidate_library_from_json(path: str) -> List[Dict[str, str]]:
     """
     Load candidate examples from a JSON file.
@@ -517,12 +532,11 @@ def load_candidate_library_from_json(path: str) -> List[Dict[str, str]]:
         # Convert alternative format to standard format
         if "Question" in entry:
             entry["question"] = entry.pop("Question")
-        if "SQL" in entry:
-            entry["sql"] = entry.pop("SQL")
-        if "query" in entry and "sql" not in entry:
-            entry["sql"] = entry.pop("query")
+        sql_text = _pick_sql_text(entry)
+        if sql_text is not None:
+            entry["sql"] = sql_text
         # Validate format
-        if "question" not in entry or "sql" not in entry:
+        if "question" not in entry or "sql" not in entry or not isinstance(entry["sql"], str):
             raise ValueError(
                 f"Entry {i} missing 'question' or 'sql' field. "
                 f"Found keys: {list(entry.keys())}"
@@ -550,10 +564,11 @@ def load_candidate_library_from_spider(
 
     candidates = []
     for entry in data:
+        sql_text = _pick_sql_text(entry) or ""
         candidates.append(
             {
                 "question": entry.get("question", ""),
-                "sql": entry.get("SQL", entry.get("query", entry.get("sql", ""))),
+                "sql": sql_text,
                 "db_id": entry.get("db_id", ""),
                 "question_id": entry.get("question_id", ""),
                 "difficulty": entry.get("difficulty", "unknown"),
