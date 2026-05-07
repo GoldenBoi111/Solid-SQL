@@ -5,6 +5,7 @@ Generate a detailed benchmark report from per-question result JSON.
 Supports result files shaped like:
 - a top-level list of question result dicts
 - or an object containing a `results` list
+- or an object containing a `detailed_results` list
 
 The script prints a console report and saves a structured JSON summary.
 """
@@ -26,10 +27,13 @@ def load_results(path: Path) -> List[Dict[str, Any]]:
     if isinstance(data, list):
         return [item for item in data if isinstance(item, dict)]
     if isinstance(data, dict):
-        results = data.get("results")
-        if isinstance(results, list):
-            return [item for item in results if isinstance(item, dict)]
-    raise ValueError("Input JSON must be a list or an object with a 'results' list.")
+        for key in ("results", "detailed_results"):
+            results = data.get(key)
+            if isinstance(results, list):
+                return [item for item in results if isinstance(item, dict)]
+    raise ValueError(
+        "Input JSON must be a list or an object with a 'results' or 'detailed_results' list."
+    )
 
 
 def pct(numerator: int, denominator: int) -> float:
